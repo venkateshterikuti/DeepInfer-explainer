@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>The cluster around it · DeepInfer Annotated</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&display=swap">
+<link rel="stylesheet" href="atlas.css">
+</head>
+<body>
+<header class="bar">
+  <div class="wrap">
+    <a class="brand" href="index.html"><b>DeepInfer</b><span>annotated</span></a>
+    <nav aria-label="Chapters">
+      <a class="num" href="loop.html" title="The generation loop">01</a>
+      <a class="num" href="model.html" title="The model it serves">02</a>
+      <a class="num" href="engine.html" title="Anatomy of the engine">03</a>
+      <a class="num" href="memory.html" title="KV memory">04</a>
+      <a class="num" href="scheduling.html" title="Scheduling a step">05</a>
+      <a class="num" href="parallelism.html" title="One model, many GPUs">06</a>
+      <a class="num" href="cluster.html" aria-current="page" title="The cluster around it">07</a>
+      <a class="num" href="replay.html" title="Bounded replay">08</a>
+      <a class="num" href="speculation.html" title="Speculative decoding">09</a>
+      <a class="num" href="kernels.html" title="Numbers and kernels">10</a>
+      <a class="num" href="sampling.html" title="Sampling, structure, determinism">11</a>
+      <a class="num" href="frontdoor.html" title="The front door">12</a>
+      <a class="num" href="measure.html" title="Measuring it">13</a>
+      <a href="index.html">Map</a>
+    </nav>
+  </div>
+  <div class="progress"></div>
+</header>
+<main>
+  <section class="hero">
+    <div class="wrap">
+      <div>
+        <span class="eyebrow"><span class="n">07</span> The service</span>
+        <h1>The cluster <em>around the engine</em></h1>
+        <p class="dek">In production, engines are parts of a larger machine: separate fleets for images, prefill and decode, a load balancer in front of each, and a 100-PiB cache behind them. The release ships the engine; the deployment Q&amp;A describes the rest.</p>
+        <div class="files">
+          <span class="tag">doc/inference_deployment_qa.md</span>
+          <span class="tag">engine/engine_type.py</span>
+          <span class="tag">doc/images/architecture_overview.png</span>
+        </div>
+      </div>
+      <div class="board stage-card" data-stage="arch" data-label="Architecture: DeepSeek Recipe and Entrypoint on top; vision encoder, prefill and decode services each behind a load balancer; KV cache flows from prefill to decode and to and from a 3FS storage cluster.">
+        <span class="ruler">E / P / D + storage</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <div class="facts">
+        <div><b>155T</b><span>tokens served per day by a single cluster</span></div>
+        <div><b>~100 PiB</b><span>of SSD holding KV cache in 3FS</span></div>
+        <div><b>3 / 7 days</b><span>KV time-to-live for agent / chat traffic</span></div>
+        <div><b>64 + 64</b><span>GPUs: the smallest efficient prefill + decode unit</span></div>
+        <div><b>~80%</b><span>of a perfectly balanced offline benchmark, achieved in production</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="split">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Disaggregation</span>
+        <h2>Why prefill and decode live apart</h2>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">Interference</span><h4>A long prefill stalls every decoder</h4><p>In a combined engine, a 300 ms prefill step means every user in the decode batch waits 300 ms for their next token. Time-between-tokens spikes whenever someone pastes a long document.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Different shapes</span><h4>Two jobs, two ideal machines</h4><p>Prefill is compute-bound: thousands of tokens per step on a few GPUs, smallest EP that fits. Decode is memory-bound: as many GPUs as possible, widest EP. One machine shape can't be optimal for both.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">E / P / D</span><h4>Three fleets</h4><p>Vision encoders run on single, cheaper GPUs. Prefill runs on ordinary 8-GPU machines at EP2–8. Decode runs on 64–128-GPU supernodes at EP64–128. In practice prefill and decode get roughly equal GPU counts, so the smallest efficient unit is 64 + 64 GPUs.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Hand-off</span><h4>Ship the KV, not the prompt</h4><p>After prefill, the request's block KV and its sliding-window KV travel to a decode engine over the same path. V4.1's KV is small enough that prefill and decode could sit in different data centers: about 400 Gbps of interconnect per 8 GPUs. DeepSeek runs them in adjacent ones.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="split" data-label="Timeline of a combined engine where a long prefill step stalls decode tokens; then two separate fleets with different GPU counts; then three fleets with a KV hand-off arrow from prefill to decode."><span class="ruler">time-between-tokens</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="lb">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Load balancing</span>
+        <h2>Four balancers, four different problems</h2>
+        <p class="lede">Each fleet balances a different cost. None of them routes by prefix, because any machine can read any prefix from storage.</p>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">Prefill · tiers</span><h4>Bucket by length</h4><p>Requests are sorted by total context into four tiers: under 16K, 16–64K, 64–256K, and 256K and up. Each tier gets its own engines and a per-batch compute cap; the number of engines per tier is reassigned from each tier's share of compute demand in the previous round.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Prefill · pull</span><h4>Engines pull, ranks share</h4><p>Engines pull work according to their remaining compute quota. Inside a data-parallel group, each arriving request goes to the rank with the lowest current quota load. No prefix-affinity routing: the cache is shared storage, not local memory.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Decode</span><h4>Balance batch size and KV length together</h4><p>Request count sets a GPU's batch size; total KV length sets its attention cost. The decode balancer spreads both at once: short requests go to GPUs with few requests but long caches, long requests to GPUs with short caches.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Vision &amp; experts</span><h4>Patches and expert loads</h4><p>Images go to a random encoder machine, then to the GPU there with the fewest pending patches, counted as (width ÷ patch) × (height ÷ patch). Inside each instance, the expert balancer from chapter 06 keeps EP ranks even. Altogether: about 80% of a perfectly balanced offline benchmark.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="lb" data-label="Requests sorted into four length tiers feeding engine groups; engines pulling by remaining quota; a decode balancer placing short and long requests by request count and KV length; images routed by pending patch counts."><span class="ruler">balancers</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="store">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">KV storage</span>
+        <h2>A cache measured in days</h2>
+        <p class="lede">Compressed KV turns a multi-turn conversation's history into something worth keeping on SSD for a week.</p>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">Three homes</span><h4>HBM, host memory, SSD</h4><p>In-flight block KV and state KV live in GPU memory. Sliding-window KV lives in the host memory of the machine that produced it, one copy, found through a directory. Paged block KV lives in a dedicated 3FS storage cluster.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">3FS</span><h4>Erasure-coded, read from any 10 of 11</h4><p>Data is stored 10+2 erasure coded. A read asks all 11 live nodes of a group and decodes from the first 10 answers. A GC worker per node evicts least-recently-used KV to stay under a disk watermark. TTL: 3 days for agent traffic, 7 for chat, whose long tail of re-reads makes old entries more valuable.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">The hit path</span><h4>Match, fetch, swap in</h4><p>The Entrypoint matches the request's hash chain against metadata before routing. A separate process fetches hit KV from 3FS into host shared memory. A thread in the engine swaps it into HBM layer by layer during the forward pass, using GPUDirect RDMA: the NIC saturates PCIe without spending GPU cores.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Hit policy</span><h4>Block KV decides; the window decides the last block</h4><p>Hit length comes from block KV in 128-token steps, capped at L − 134 (window plus speculative backtracking). If the sliding-window state for the last hit block is missing, the hit backs off one block and that block is replayed (chapter 08).</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="tiers" data-label="Three storage tiers: GPU memory, host memory, and an erasure-coded SSD cluster; a read fanning out to 11 nodes and completing from 10; a request's prefix fetched from SSD to host to GPU layer by layer; the hit-length policy on a prompt bar."><span class="ruler">where KV lives</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="lab">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Try it</span>
+        <h2>What a cache hit saves</h2>
+        <p class="lede">Pick a prompt, how much of it is already in storage, and whether the sliding-window state survived. The hit policy decides how much prefill is left.</p>
+      </header>
+      <div class="lab">
+        <div class="controls" id="hit-ctl">
+          <div class="ctl"><label for="hl">Prompt length (tokens) <output for="hl">64K</output></label><input type="range" id="hl" min="2" max="9" step="1" value="6"></div>
+          <div class="ctl"><label for="hp">Prefix found in storage <output for="hp">90%</output></label><input type="range" id="hp" min="0" max="100" step="1" value="90"></div>
+          <div class="ctl"><label>Sliding-window state for the last hit block</label>
+            <div class="seg" id="swa"><button type="button" value="hit" aria-pressed="true">present</button><button type="button" value="miss" aria-pressed="false">missing</button></div>
+          </div>
+          <div class="readout">
+            <div><b id="h-len">–</b><span>usable hit (tokens)</span></div>
+            <div><b id="h-pre">–</b><span>tokens to prefill</span></div>
+          </div>
+          <p class="note">Block size 128 and the L − 134 cap are from the deployment Q&amp;A. Prefill time uses chapter 05's illustrative cost model.</p>
+        </div>
+        <div class="board" data-stage="hit" data-label="Prompt bar showing the stored prefix, the usable hit after the cap and back-off, the replayed block, and the new suffix to prefill, with prefill time with and without the cache."><span class="ruler">hit policy</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="ops">
+    <div class="wrap stack">
+      <header>
+        <span class="eyebrow">Operations</span>
+        <h2>Scaling and surviving failures</h2>
+      </header>
+      <div class="compare">
+        <article class="alt"><div><h4>Autoscaling</h4></div><div><p>Prefill machines scale with the number of non-cached tokens; decode scales with running requests. Changes are rate-limited and bounded, and scale-in is forbidden while quota utilization is above 0.8.</p></div><div class="vs">Spare ready machines are kept unassigned in the pool as scale-out inventory.</div></article>
+        <article class="alt"><div><h4>Draining decode</h4></div><div><p>Wide-EP decode instances are hurt by long-tail requests. A decode engine told to shut down gets a one-minute grace period, then forwards every unfinished request with its KV to other decode engines in one shot.</p></div><div class="vs">No request is dropped to scale in.</div></article>
+        <article class="alt"><div><h4>EP failover</h4></div><div><p>All GPUs in a wide-EP instance form one communication domain, so one bad GPU takes down the instance. On restart the platform sets the EP size to however many healthy GPUs it actually got.</p></div><div class="vs">Restarts take minutes; resilience comes from spare quota and request rerouting, not fast restarts.</div></article>
+        <article class="alt"><div><h4>Storage sizing</h4></div><div><p>Recommended KV storage servers: 20 × 30.73 TB SSDs each, at least 40 GB/s read and 5 GB/s write, sized to hold 24 hours of data. In practice about 14.4 TB of logical KV per online GPU.</p></div><div class="vs">Storage nodes fail an order of magnitude less often than compute nodes, so KV survives compute failures.</div></article>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="others">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Other ways to do it</span>
+        <h2>Disaggregation and caching elsewhere</h2>
+        <p class="lede">The industry converged on splitting prefill from decode. Where it disagrees is where the cache lives and whether routing follows it.</p>
+      </header>
+      <div class="compare" id="alts-cluster"></div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap"><div class="sources" id="sources-cluster"></div></div>
+  </section>
+
+</main>
+<nav class="next" aria-label="Chapter navigation">
+  <div class="wrap">
+    <a href="parallelism.html"><span>← Chapter 06</span><b>One model, many GPUs</b></a>
+    <a class="fwd" href="replay.html"><span>Chapter 08 →</span><b>Bounded replay</b></a>
+  </div>
+</nav>
+<script src="atlas.js"></script>
+<script src="alts.js"></script>
+<script>
+(function () {
+  const { ramp, ease, clamp, lerp, rng } = Atlas;
+  const cost = (q, c) => 3 + 0.0105 * q + 1.6e-8 * (q * q / 2 + q * c);
+  function prefillMs(start, L, budget = 380) {
+    let c = start, t = 0, guard = 0;
+    while (c < L && guard++ < 4000) {
+      const a = 0.8e-8, B = 0.0105 + 1.6e-8 * c, C0 = 3 - budget;
+      const q = Math.max(1, Math.min(32768, Math.floor((-B + Math.sqrt(B * B - 4 * a * C0)) / (2 * a)), L - c));
+      t += cost(q, c); c += q;
+    }
+    return t;
+  }
+
+  /* ---------------- hero: architecture with traffic ---------------- */
+  Atlas.scene("arch", (g, s) => {
+    const { W, H } = g;
+    const cx = W / 2;
+    const bw = (W - 100) / 3, rowY = [40, 108, 188, 270, 380];
+    const box = (x, y, w, h, c, t, sub, a = 1, dash) => g.box(x, y, w, h, { color: c, title: t, sub, tsize: 15, tfont: "mono", tweight: 600, ssize: 11, a, dash });
+    box(cx - 130, rowY[0], 260, 46, "ok", "DeepSeek Recipe", null);
+    box(cx - 130, rowY[1], 260, 46, "bad", "Entrypoint", null);
+    const cols = [30, 50 + bw, 70 + 2 * bw];
+    box(cols[0], rowY[2], bw, 44, "net", "Vision LB", null, 1, [6, 5]);
+    box(cols[1], rowY[2], bw, 44, "net", "Prefill LB", null, 1, [6, 5]);
+    box(cols[2], rowY[2], bw, 44, "net", "Decode LB", null, 1, [6, 5]);
+    box(cols[0], rowY[3], bw, 70, "cpu", "Vision enc.", "1 GPU each");
+    box(cols[1], rowY[3], bw, 70, "compute", "Prefill", "8-GPU · EP2–8");
+    box(cols[2], rowY[3], bw, 70, "memory", "Decode", "EP64–128");
+    box(cols[1], rowY[4], bw * 2 + 20, 46, "ink-3", "KV storage · 3FS", null, 1, [6, 5]);
+    // static arrows
+    const A = (x1, y1, x2, y2, c = "ink-3", lw = 1.5) => g.arrow(x1, y1, x2, y2, { color: c, lw, head: 8 });
+    A(cx, rowY[0] + 46, cx, rowY[1]);
+    A(cx - 60, rowY[1] + 46, cols[1] + bw / 2, rowY[2]);
+    A(cols[1] + bw / 2, rowY[2] + 44, cols[1] + bw / 2, rowY[3]);
+    A(cols[2] + bw / 2, rowY[2] + 44, cols[2] + bw / 2, rowY[3]);
+    A(cols[0] + bw / 2, rowY[2] + 44, cols[0] + bw / 2, rowY[3]);
+    A(cols[0] + bw, rowY[3] + 35, cols[1], rowY[3] + 35, "cpu");
+    const pulse = 0.5 + 0.5 * Math.sin(s.t * 3);
+    A(cols[1] + bw, rowY[3] + 35, cols[2], rowY[3] + 35, "compute", 3 + pulse * 2);
+    g.text("KV", (cols[1] + bw + cols[2]) / 2, rowY[3] + 26, { size: 12, color: "compute", align: "center", weight: 700 });
+    A(cols[1] + bw / 2, rowY[4], cols[1] + bw / 2, rowY[3] + 70, "compute", 2.5);
+    A(cols[2] + bw / 2, rowY[3] + 70, cols[2] + bw / 2, rowY[4], "compute", 2.5);
+    // request dot path
+    const path = [[cx, rowY[1] + 23], [cols[1] + bw / 2, rowY[2] + 22], [cols[1] + bw / 2, rowY[3] + 35], [cols[2] + bw / 2, rowY[3] + 35], [cols[2] + bw / 2, rowY[2] + 22], [cx + 100, rowY[1] + 23]];
+    const per = 5, ph = (s.t % per) / per * (path.length - 1);
+    const i = Math.min(path.length - 2, Math.floor(ph)), u = ease(ph - i);
+    g.circle(lerp(path[i][0], path[i + 1][0], u), lerp(path[i][1], path[i + 1][1], u), 8, { fill: "ok", stroke: "sheet", lw: 2 });
+    g.text("dashed: described in the Q&A, not in this release", 30, H - 16, { size: 12, color: "ink-3" });
+  }, { anim: true, restT: 1.6, zoom: 1.0, minW: 640 });
+
+  /* ---------------- why split ---------------- */
+  Atlas.scene("split", (g, s) => {
+    const { W, H, narrow } = g;
+    const a0 = s.solo(0);
+    if (a0 > 0.01) {
+      const x0 = 40, x1 = W - 40, y = 140, sc = (x1 - x0) / 20;
+      g.text("ONE ENGINE · ONE QUEUE", x0, 70, { size: 20, font: "display", weight: 800, color: "bad", a: a0 });
+      g.text("GPU steps", x0, y - 12, { size: 13, color: "ink-3", a: a0 });
+      let t = 0;
+      const steps = [[1, "d"], [1, "d"], [1, "d"], [1, "d"], [6, "p"], [1, "d"], [1, "d"], [1, "d"], [1, "d"], [1, "d"], [1, "d"], [1, "d"]];
+      steps.forEach(([ln, k]) => { g.rect(x0 + t * sc, y, ln * sc - 3, 40, { fill: k === "p" ? "compute" : "memory", r: 4, a: a0 * 0.85 }); if (k === "p") g.text("someone's 100K-token prefill", x0 + (t + ln / 2) * sc, y + 25, { size: 12, color: "sheet", align: "center", weight: 600, a: a0 }); t += ln; });
+      const uy = y + 120;
+      g.text("your tokens arriving", x0, uy - 30, { size: 13, color: "ink-3", a: a0 });
+      t = 0;
+      steps.forEach(([ln, k]) => { if (k === "d") g.rect(x0 + (t + 0.5) * sc - 3, uy - 18, 6, 36, { fill: "ok", r: 3, a: a0 }); t += ln; });
+      g.dim(x0 + 3.5 * sc, x0 + 10.5 * sc, uy + 40, "time-between-tokens spike", { color: "bad", a: a0 });
+    }
+    const a1 = s.solo(1), a2 = s.at(2);
+    if (a1 > 0.01 && a2 < 0.5) {
+      const a = a1;
+      g.text("PREFILL", 40, 80, { size: 22, font: "display", weight: 800, color: "compute", a });
+      for (let k = 0; k < 8; k++) g.rect(40 + (k % 4) * 46, 100 + Math.floor(k / 4) * 46, 40, 40, { fill: "compute", r: 5, a: a * 0.8 });
+      g.text("compute-bound · few GPUs · EP2–8", 40, 220, { size: 14, color: "ink-2", a });
+      const dx = narrow ? 40 : W * 0.45;
+      const dy = narrow ? 270 : 80;
+      g.text("DECODE", dx, dy, { size: 22, font: "display", weight: 800, color: "memory", a });
+      const cs = Math.min(26, (W - dx - 40) / 8 - 4);
+      for (let k = 0; k < 64; k++) g.rect(dx + (k % 8) * (cs + 4), dy + 20 + Math.floor(k / 8) * (cs + 4), cs, cs, { fill: "memory", r: 3, a: a * 0.8 });
+      g.text("memory-bound · many GPUs · EP64–128", dx, dy + 20 + 8 * (cs + 4) + 22, { size: 14, color: "ink-2", a });
+    }
+    if (a2 > 0.01) {
+      const colW = (W - 100) / 3, y0 = 90;
+      const fleets = [["VISION", "cpu", "1 cheaper GPU each", 1], ["PREFILL", "compute", "8-GPU machines", 8], ["DECODE", "memory", "64–128-GPU supernodes", 64]];
+      fleets.forEach(([n, c, sub, k], i) => {
+        const x = 30 + i * (colW + 20);
+        g.text(n, x, y0 - 20, { size: 20, font: "display", weight: 800, color: c, a: a2 });
+        g.text(sub, x, y0, { size: 12, color: "ink-3", a: a2 });
+        const per = k === 1 ? 1 : k === 8 ? 4 : 8, cs = Math.min(22, colW / per - 4);
+        const groups = k === 1 ? 6 : k === 8 ? 3 : 1;
+        for (let gi = 0; gi < groups; gi++) {
+          const gy = y0 + 20 + gi * (k === 1 ? 38 : (Math.ceil(k / per) * (cs + 4) + 16));
+          for (let j = 0; j < k; j++) g.rect(x + (j % per) * (cs + 4), gy + Math.floor(j / per) * (cs + 4), cs, cs, { fill: c, r: 3, a: a2 * 0.8 });
+        }
+      });
+      const ha = s.at(3);
+      if (ha > 0.01) {
+        const x1 = 30 + colW, x2 = 30 + 2 * (colW + 20);
+        const y = H - 120;
+        g.arrow(x1 + 20, y, x2 - 10, y, { color: "compute", lw: 6, head: 18, a: ha });
+        g.text("block KV + window KV", (x1 + x2) / 2, y - 16, { size: 14, color: "compute", align: "center", weight: 600, a: ha });
+        g.line((x1 + x2) / 2, y - 60, (x1 + x2) / 2, y + 40, { color: "ink-3", dash: [6, 6], a: ha });
+        g.text("≈400 Gbps per 8 GPUs is enough to cross data centers", W / 2, H - 50, { size: 14, color: "ink", align: "center", weight: 600, a: ha });
+      }
+    }
+  }, { anim: false });
+
+  /* ---------------- load balancers ---------------- */
+  Atlas.scene("lb", (g, s) => {
+    const { W, H, narrow } = g;
+    const a0 = s.solo(0), a1 = s.solo(1), a2 = s.solo(2), a3 = s.solo(3);
+    const tiers = [["< 16K", 0.45], ["16–64K", 0.3], ["64–256K", 0.17], ["≥ 256K", 0.08]];
+    if (a0 + a1 > 0.01) {
+      const a = Math.max(a0, a1);
+      const lx = 40, ly = 70, lw = narrow ? W * 0.32 : W * 0.28;
+      tiers.forEach(([n, share], i) => {
+        const y = ly + i * ((H - 140) / 4);
+        g.text(n, lx, y + 20, { size: 15, color: "ink", weight: 600, a });
+        // queue dots moving right
+        for (let k = 0; k < 5; k++) { const ph = ((s.t * 0.6 + k / 5 + i * 0.13) % 1); g.circle(lx + 80 + ph * (lw - 90), y + 15, 4 + i * 2, { fill: "compute", a: a * (1 - ph * 0.5) }); }
+        const ex = lx + lw + 20, n_e = Math.max(1, Math.round(share * 12));
+        for (let k = 0; k < n_e; k++) {
+          const x = ex + k * 40;
+          if (x > W - 60) break;
+          g.rect(x, y, 34, 30, { fill: "sheet", stroke: "compute", lw: 1.4, r: 4, a });
+          if (a1 > 0.2) { const q = 0.3 + 0.6 * ((k * 37 + i * 11) % 10) / 10; g.rect(x + 3, y + 30 - 4 - 22 * q, 28, 22 * q, { fill: "cpu", r: 2, a: a1 }); }
+        }
+      });
+      if (a0 > 0.2) g.text("engines per tier follow last round's compute demand", 40, H - 30, { size: 13, color: "ink-2", a: a0 });
+      if (a1 > 0.2) g.text("purple = remaining compute quota · engines pull work · no prefix affinity", 40, H - 30, { size: 13, color: "cpu", a: a1 });
+    }
+    if (a2 > 0.01) {
+      const n = narrow ? 6 : 8, gw = (W - 80) / n;
+      const reqs = [3, 9, 5, 2, 7, 4, 6, 8], kv = [8, 2, 6, 9, 3, 7, 4, 5];
+      for (let i = 0; i < n; i++) {
+        const x = 40 + i * gw, base = H - 90;
+        g.rect(x + 6, base - reqs[i] * 18, gw / 2 - 10, reqs[i] * 18, { fill: "memory", r: 3, a: a2 * 0.85 });
+        g.rect(x + gw / 2, base - kv[i] * 18, gw / 2 - 10, kv[i] * 18, { fill: "net", r: 3, a: a2 * 0.85 });
+        g.text("GPU" + i, x + gw / 2, base + 18, { size: 11, color: "ink-3", align: "center", a: a2 });
+      }
+      g.chip(40, 60, "requests (batch size)", "memory", { a: a2, size: 13 });
+      g.chip(260, 60, "total KV length (attention cost)", "net", { a: a2, size: 13 });
+      const ph = (s.t % 3) / 3;
+      const tgtS = 40 + 3 * gw + gw / 2, tgtL = 40 + 1 * gw + gw / 2;
+      g.circle(lerp(W / 2, tgtS, ease(ph)), lerp(110, H - 90 - 9 * 18 - 20, ease(ph)), 7, { fill: "ok", a: a2 });
+      g.text("short request → few requests, long caches", W / 2 + 10, 104, { size: 12, color: "ok", a: a2 });
+      g.rect(lerp(W / 2, tgtL, ease(ph)) - 14, lerp(140, H - 90 - 9 * 18 - 40, ease(ph)) - 5, 28, 10, { fill: "bad", r: 3, a: a2 });
+      g.text("long request → short caches", W / 2 + 10, 134, { size: 12, color: "bad", a: a2 });
+    }
+    if (a3 > 0.01) {
+      const m = 3, mw = (W - 100) / m;
+      const patches = [[12, 30, 8, 22], [40, 18, 26, 31], [9, 27, 35, 15]];
+      g.text("image → random machine → GPU with the fewest pending patches", 40, 70, { size: 14, color: "ink", weight: 600, a: a3 });
+      patches.forEach((ps, mi) => {
+        const x = 30 + mi * (mw + 20), y = 110;
+        g.rect(x, y, mw, 220, { fill: "sheet", stroke: "hair", r: 8, a: a3 });
+        g.text("machine " + mi, x + 10, y + 22, { size: 12, color: "ink-3", a: a3 });
+        const mn = Math.min(...ps);
+        ps.forEach((p, k) => {
+          const by = y + 40 + k * 44;
+          g.rect(x + 10, by, (mw - 20) * p / 40, 30, { fill: mi === 1 ? (p === mn ? "ok" : "cpu") : "cpu", r: 3, a: a3 * (mi === 1 ? 0.9 : 0.35) });
+          g.text(p + " patches", x + 16, by + 20, { size: 11, color: "sheet", weight: 600, a: a3 });
+        });
+      });
+      g.text("patches = (width ÷ patch size) × (height ÷ patch size)", 40, H - 40, { size: 13, color: "ink-3", a: a3 });
+    }
+  }, { anim: true, restT: 1 });
+
+  /* ---------------- storage tiers ---------------- */
+  Atlas.scene("tiers", (g, s) => {
+    const { W, H, narrow } = g;
+    const a0 = s.solo(0), a1 = s.solo(1), a2 = s.solo(2), a3 = s.solo(3);
+    if (a0 > 0.01) {
+      const rows = [["GPU HBM", "in-flight block KV + state slots", "compute", "per request, while it runs"], ["HOST MEMORY", "sliding-window KV · one copy · directory", "memory", "pulled across machines over a 400G VLAN"], ["3FS SSD CLUSTER", "paged block KV · ~100 PiB", "ink-2", "shared by every prefill and decode machine"]];
+      rows.forEach(([n, d, c, sub], i) => {
+        const y = 70 + i * ((H - 120) / 3), w = W - 80 - i * 0;
+        g.box(40, y, w, (H - 160) / 3, { color: c, wash: 0.08, a: a0 });
+        g.text(n, 60, y + 36, { size: 22, font: "display", weight: 800, color: c, a: a0 });
+        g.text(d, 60, y + 60, { size: 14, color: "ink", a: a0 });
+        g.text(sub, 60, y + 82, { size: 12, color: "ink-3", a: a0 });
+      });
+    }
+    if (a1 > 0.01) {
+      const n = 12, cx = W / 2, cy = H / 2 + 20, R = Math.min(W, H) * 0.32;
+      g.box(cx - 70, cy - 30, 140, 60, { color: "compute", title: "reader", tsize: 18, a: a1 });
+      const lat = [0.5, 0.8, 0.6, 1.4, 0.7, 0.55, 0.9, 0.65, 0.75, 1.1, 0.6];
+      const sorted = lat.slice().sort((a, b) => a - b), cutoff = sorted[9];
+      const ph = (s.t % 3.2) / 2.2;
+      for (let k = 0; k < n; k++) {
+        const ang = -Math.PI / 2 + (k / n) * Math.PI * 2, x = cx + R * Math.cos(ang), y = cy + R * Math.sin(ang);
+        const down = k === 11, parity = k >= 10;
+        g.rect(x - 26, y - 18, 52, 36, { fill: down ? "bad" : parity ? "memory" : "ink-3", r: 5, a: a1 * (down ? 0.4 : 0.8) });
+        g.text(down ? "down" : parity ? "parity" : "data", x, y + 4, { size: 11, color: "sheet", align: "center", weight: 600, a: a1 });
+        if (!down) {
+          const l = lat[k], used = l <= cutoff, u = clamp(ph / l);
+          if (u > 0 && u < 1) g.circle(lerp(x, cx, u), lerp(y, cy, u), 5, { fill: used ? "ok" : "ink-3", a: a1 });
+        }
+      }
+      g.text("10 + 2 erasure coding: ask 11 live nodes, decode from the first 10", 40, 60, { size: 14, color: "ink", weight: 600, a: a1 });
+      g.text("LRU garbage collection per node · TTL 3 days agent / 7 days chat", 40, H - 30, { size: 13, color: "ink-3", a: a1 });
+    }
+    if (a2 > 0.01) {
+      const stages = [["Entrypoint", "hash-chain prefix match (metadata only)", "bad"], ["fetch process", "3FS → host shared memory", "ink-2"], ["swap-in thread", "host → HBM via GPUDirect RDMA", "memory"]];
+      stages.forEach(([n, d, c], i) => { const y = 70 + i * 76; g.box(40, y, W - 80, 60, { color: c, a: a2, wash: 0.08 }); g.text(n, 60, y + 26, { size: 15, color: c, weight: 600, a: a2 }); g.text(d, 60, y + 46, { size: 13, color: "ink-2", a: a2 }); });
+      const ty = 70 + 3 * 76 + 20, lw = (W - 120) / 10;
+      g.text("forward pass, layer by layer", 40, ty, { size: 13, color: "ink-3", a: a2 });
+      const cur = (s.t * 4) % 12;
+      for (let l = 0; l < 10; l++) {
+        g.rect(40 + l * (lw + 4), ty + 30, lw, 26, { fill: "compute", r: 3, a: a2 * (l < cur - 1 ? 0.85 : 0.2) });
+        g.rect(40 + l * (lw + 4), ty + 62, lw, 18, { fill: "memory", r: 3, a: a2 * (l < cur ? 0.85 : 0.2) });
+      }
+      g.text("KV for layer l arrives while layer l−1 computes", 40, ty + 104, { size: 13, color: "memory", a: a2 });
+    }
+    if (a3 > 0.01) {
+      const x0 = 40, x1 = W - 40, y = 140, L = 1000;
+      const sx = (v) => x0 + (x1 - x0) * v / L;
+      g.text("prompt of length L, in 128-token blocks", x0, y - 20, { size: 13, color: "ink-3", a: a3 });
+      for (let k = 0; k < 8; k++) g.rect(sx(k * 128) + 1, y, sx(128) - x0 - 2, 44, { fill: k < 6 ? "ok" : "grid", r: 4, a: a3 * (k < 6 ? 0.75 : 1) });
+      g.line(sx(L - 134), y - 30, sx(L - 134), y + 70, { color: "bad", lw: 2, dash: [5, 5], a: a3 });
+      g.text("cap L − 134", sx(L - 134) + 6, y + 70, { size: 13, color: "bad", a: a3 });
+      g.dim(sx(0), sx(768), y + 72, "L1 from block KV (multiple of 128)", { color: "ok", a: a3 });
+      const miss = (s.t % 4) > 2;
+      g.rect(sx(640) + 1, y, sx(128) - x0 - 2, 44, { stroke: miss ? "bad" : "ok", lw: 3, r: 4, a: a3 });
+      g.text(miss ? "window state for this block missing → hit = L1 − 128, replay it" : "window state present → hit = L1", x0, y + 130, { size: 15, color: miss ? "bad" : "ok", weight: 600, a: a3 });
+    }
+  }, { anim: true, restT: 1.2 });
+
+  /* ---------------- hit lab ---------------- */
+  Atlas.scene("hit", (g, s) => {
+    const st = s.state; if (st.hl === undefined) return;
+    const L = 1024 * Math.pow(2, st.hl);
+    const stored = Math.floor((L * st.hp / 100) / 128) * 128;
+    const cap = Math.floor((L - 134) / 128) * 128;
+    const L1 = Math.max(0, Math.min(stored, cap));
+    const miss = st.swa === "miss";
+    const hit = miss ? Math.max(0, L1 - 128) : L1;
+    const pre = L - hit;
+    document.getElementById("h-len").textContent = hit.toLocaleString();
+    document.getElementById("h-pre").textContent = pre.toLocaleString();
+    const { W, H } = g;
+    const x0 = 40, x1 = W - 40, y = 90;
+    const sx = (v) => x0 + (x1 - x0) * v / L;
+    g.text(`prompt: ${L.toLocaleString()} tokens`, x0, y - 20, { size: 14, color: "ink-2", weight: 600 });
+    g.rect(x0, y, x1 - x0, 50, { fill: "grid", stroke: "hair", r: 6 });
+    g.rect(x0, y, sx(stored) - x0, 50, { fill: "ok", r: 6, a: 0.3 });
+    g.rect(x0, y, sx(hit) - x0, 50, { fill: "ok", r: 6, a: 0.85 });
+    if (miss && L1 > 0) g.rect(sx(hit), y, sx(L1) - sx(hit), 50, { fill: "memory", r: 2, a: 0.85 });
+    g.rect(sx(L1), y, x1 - sx(L1), 50, { fill: "compute", r: 2, a: 0.6 });
+    g.line(sx(L - 134), y - 12, sx(L - 134), y + 62, { color: "bad", lw: 2, dash: [4, 4] });
+    const leg = [["reused from storage", "ok", 0.85], ["stored but unusable (cap / not a full block)", "ok", 0.3], ["replayed (window rebuilt)", "memory", 0.85], ["prefilled", "compute", 0.6]];
+    leg.forEach(([t, c, a], i) => { g.rect(x0, y + 82 + i * 26, 16, 16, { fill: c, r: 3, a }); g.text(t, x0 + 26, y + 95 + i * 26, { size: 13, color: "ink-2" }); });
+    const tNo = prefillMs(0, L), tHit = prefillMs(hit, L);
+    const by = y + 210, bw = x1 - x0 - 140;
+    const mx = Math.max(tNo, 1);
+    g.text("no cache", x0, by + 18, { size: 13, color: "ink-2" });
+    g.rect(x0 + 120, by, bw, 28, { fill: "compute", r: 4, a: 0.35 });
+    g.text((tNo / 1000).toFixed(2) + " s", x0 + 128, by + 19, { size: 13, color: "ink", weight: 600 });
+    g.text("with cache", x0, by + 58, { size: 13, color: "ink-2" });
+    g.rect(x0 + 120, by + 40, Math.max(2, bw * tHit / mx), 28, { fill: "ok", r: 4, a: 0.85 });
+    g.text((tHit / 1000).toFixed(2) + " s", x0 + 128 + Math.max(2, bw * tHit / mx), by + 59, { size: 13, color: "ink", weight: 600 });
+    g.text(`prefill time saved: ${(100 * (1 - tHit / tNo)).toFixed(0)}%  (one DP rank, illustrative cost model)`, x0, by + 106, { size: 15, color: "ink", weight: 600 });
+  }, { controls: "hit-ctl", format: (id, v) => id === "hl" ? (Math.pow(2, v) >= 1024 ? Math.pow(2, v) / 1024 + "M" : Math.pow(2, v) + "K") : v + "%" });
+})();
+
+</script>
+<script>AtlasAlts.render("alts-cluster", "sources-cluster", "cluster");</script>
+</body>
+</html>

@@ -1,0 +1,608 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>The front door · DeepInfer Annotated</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&display=swap">
+<link rel="stylesheet" href="atlas.css">
+</head>
+<body>
+<header class="bar">
+  <div class="wrap">
+    <a class="brand" href="index.html"><b>DeepInfer</b><span>annotated</span></a>
+    <nav aria-label="Chapters">
+      <a class="num" href="loop.html" title="The generation loop">01</a>
+      <a class="num" href="model.html" title="The model it serves">02</a>
+      <a class="num" href="engine.html" title="Anatomy of the engine">03</a>
+      <a class="num" href="memory.html" title="KV memory">04</a>
+      <a class="num" href="scheduling.html" title="Scheduling a step">05</a>
+      <a class="num" href="parallelism.html" title="One model, many GPUs">06</a>
+      <a class="num" href="cluster.html" title="The cluster around it">07</a>
+      <a class="num" href="replay.html" title="Bounded replay">08</a>
+      <a class="num" href="speculation.html" title="Speculative decoding">09</a>
+      <a class="num" href="kernels.html" title="Numbers and kernels">10</a>
+      <a class="num" href="sampling.html" title="Sampling, structure, determinism">11</a>
+      <a class="num" href="frontdoor.html" aria-current="page" title="The front door">12</a>
+      <a class="num" href="measure.html" title="Measuring it">13</a>
+      <a href="index.html">Map</a>
+    </nav>
+  </div>
+  <div class="progress"></div>
+</header>
+<main>
+  <section class="hero">
+    <div class="wrap">
+      <div>
+        <span class="eyebrow"><span class="n">12</span> In and out</span>
+        <h1>The <em>front door</em></h1>
+        <p class="dek">The engine speaks token IDs. Before a request reaches it, an API call has to become a prompt and the prompt has to become tokens; images have to become hundreds of placeholder tokens. On the way out, a token stream has to become text, reasoning and tool calls again.</p>
+        <div class="files">
+          <span class="tag">deepseek-recipe (separate repo)</span>
+          <span class="tag">ve/multimodal_processor.py</span>
+          <span class="tag">ve/processor/image_processor.py</span>
+          <span class="tag">entrypoints/llm.py</span>
+        </div>
+      </div>
+      <div class="board stage-card" data-stage="door" data-label="Three API request shapes merge into one conversation, render into a prompt with special tokens marked, become token IDs for the engine; the returning token stream is parsed back into reasoning, text and tool-call events.">
+        <span class="ruler">API ⇄ tokens</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <div class="facts">
+        <div><b>3 → 1</b><span>request formats (Chat Completions, Responses, Messages) into one conversation</span></div>
+        <div><b>Rust</b><span>conversion, encoding and parsing, with Python bindings</span></div>
+        <div><b>42 px</b><span>image square per token: 14-pixel patches merged 3 × 3</span></div>
+        <div><b>1,024</b><span>maximum tokens per image</span></div>
+        <div><b>h × (w + 1) + 2</b><span>tokens for an image h tokens tall and w wide</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="encode">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Requests in</span>
+        <h2>One conversation, safely encoded</h2>
+        <p class="lede">DeepSeek Recipe, released alongside DeepInfer, does the API side. Its behaviour is aligned with DeepSeek's own API.</p>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">Three formats</span><h4>Convert first, render once</h4><p>Chat Completions, Responses and Messages requests are each converted into one conversation type: messages, images, tools, thinking mode, response format. One template per model version renders that into a prompt, so every API gets identical prompts. If a request sets no <code>max_tokens</code>, the default is 8,192, or 65,536 in thinking mode (131,072 at maximum effort), lowered to whatever context is left.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Special tokens by position</span><h4>Text can't become a control token</h4><p>While rendering, Recipe records the exact byte ranges where it inserted control tokens like <code>&lt;｜User｜&gt;</code>. Only those ranges become special token IDs; everything else is encoded as plain text with the special vocabulary removed. A user who types <code>&lt;｜User｜&gt;</code> gets ordinary tokens that spell it, not a new turn.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Parallel segments</span><h4>Known boundaries, independent pieces</h4><p>Because the special-token positions are already known, the text between them never needs scanning for special tokens, and BPE never merges across them. Each segment encodes on its own, in parallel, and the results are concatenated in order. Long prompts tokenize faster.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="enc" data-label="Three request shapes converging on a conversation and a rendered prompt; the prompt with special-token ranges highlighted and a user-typed lookalike staying plain text; the text segments between special tokens encoded in parallel lanes then concatenated."><span class="ruler">request → conversation → token IDs</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="stream">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Tokens out</span>
+        <h2>Parsing a stream that arrives in pieces</h2>
+        <p class="lede">The engine returns tokens a few at a time. A character, a tag or a tool argument can be split across chunks, so the parser is a state machine that never rescans.</p>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">Bytes</span><h4>Hold half a character</h4><p>A token can end in the middle of a multi-byte UTF-8 character: a Chinese character is 3 bytes, an emoji 4. Those tokens are buffered until the next ones complete the character, and only then passed to the parser.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Markers</span><h4>Recognized by token ID</h4><p>The end of reasoning (<code>&lt;/think&gt;</code>) and the start of a tool-call block (<code>｜DSML｜</code>) are found by their special token IDs. If the model writes the same characters with ordinary tokens, they stay literal text and can't end reasoning or trigger a tool call. Text delimiters are matched with incremental KMP, so a marker split across chunks is picked up without rescanning.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Tool arguments</span><h4>JSON built as it streams</h4><p>A tool's name is sent as soon as it's parsed. Arguments arrive in DSML parameter tags and are turned straight into JSON fragments: string values escaped piece by piece, arrays and objects passed through as their JSON text. No complete argument object is ever built, so the first fragment of a long argument goes out immediately.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="parse" data-label="Token chunks with a 3-byte character split across two of them, held in a buffer; a stream switching from reasoning to text to a tool call at special token IDs while a lookalike written in plain tokens stays text; DSML parameter tags turning into streamed JSON fragments."><span class="ruler">token stream → events</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="vision">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Images</span>
+        <h2>One placeholder, hundreds of tokens</h2>
+        <p class="lede">This part is in DeepInfer itself. Each image arrives as one placeholder token and its width and height.</p>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">Expand</span><h4>Rows of image tokens</h4><p>The engine replaces each placeholder with a start token, then for every row of the image <i>w</i> image tokens and a newline token, then an end token: <i>h</i> × (<i>w</i> + 1) + 2 in all. The vision encoder's 2-D features go into a model whose positions are 1-D, so the newlines mark where rows end.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Geometry</span><h4>14-pixel patches, merged 3 × 3</h4><p>The image is resized to a multiple of 14 pixels; the 32-layer vision encoder sees one patch per 14 × 14 square, and patches are merged 3 × 3, so each LLM token covers 42 × 42 pixels. Images under 544 × 544 pixels' worth of area are scaled up; if the tokens would exceed 1,024, the largest size that fits is solved for directly.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Off the main process</span><h4>Workers, shared memory, cache hits</h4><p>Forked worker processes decode and resize images and write the tensors into a pinned shared-memory pool; a request becomes schedulable once its images are ready, and stalled workers are detected. If the KV cache already covers an image's whole token span, its bytes are dropped before they're even sent to a worker.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">In production</span><h4>Encoders on their own GPUs</h4><p>DeepSeek runs vision encoders as a separate stage, one cheaper GPU per instance. A prefill machine picks a vision-encoder machine at random; that machine hands the image to its GPU with the fewest pending patches, counted as (width ÷ 14) × (height ÷ 14). The release has most of the engine side of this; the disaggregated deployment isn't included.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="vis" data-label="A prompt with one image placeholder expanding into a grid of image tokens with newline tokens at row ends; an image divided into 14-pixel patches merged into 42-pixel tokens; worker processes writing tensors into a shared memory pool with a cached image skipped; prefill machines routing images to the vision-encoder GPU with the fewest pending patches."><span class="ruler">placeholder → tokens</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="lab">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Try it</span>
+        <h2>How many tokens is this image?</h2>
+        <p class="lede">The same arithmetic as <code>compute_image_layout</code>, with V4.1 Flash's settings: 14-pixel patches, 3 × 3 merge, at most 1,024 tokens, at least 295,936 pixels.</p>
+      </header>
+      <div class="lab">
+        <div class="controls" id="img-ctl">
+          <div class="ctl"><label for="iw">Width (px) <output for="iw">1280</output></label><input type="range" id="iw" min="64" max="4096" step="16" value="1280"></div>
+          <div class="ctl"><label for="ih">Height (px) <output for="ih">720</output></label><input type="range" id="ih" min="64" max="4096" step="16" value="720"></div>
+          <div class="readout">
+            <div><b id="im-tok">–</b><span>tokens in the prompt</span></div>
+            <div><b id="im-size">–</b><span>size the encoder sees</span></div>
+          </div>
+          <p class="note" id="im-note">–</p>
+        </div>
+        <div class="board" data-stage="imgtok" data-label="The image rectangle at its resized size divided into 42-pixel token cells, with a newline marker at the end of each row and start and end tokens."><span class="ruler">resized image · token grid</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="code">
+    <div class="wrap stack">
+      <header>
+        <span class="eyebrow">In the repo</span>
+        <h2>Solving for the largest image that fits</h2>
+      </header>
+      <div class="split">
+        <div class="code">
+          <div class="hd"><span>ve/processor/image_processor.py · solve_resize_ratio</span><a href="https://github.com/deepseek-ai/DeepInfer/blob/main/deepinfer/ve/processor/image_processor.py" target="_blank" rel="noopener">source</a></div>
+<pre>r = height / width                       <span class="c"># (1)</span>
+<span class="c"># h * (w + 1) = max_n_token - 2          (2)</span>
+max_w_float = math.sqrt((max_n_token - <span class="n">2</span>) / r + <span class="n">0.25</span>) - <span class="n">0.5</span>
+max_h_float = max_w_float * r
+...
+max_w = math.floor(max_w_float)
+max_h = math.floor(max_h_float)
+beta = min(max_w * patch_size * downsample_ratio / width,
+           max_h * patch_size * downsample_ratio / height)
+best_width = math.floor(width * beta / patch_size) * patch_size
+best_height = math.floor(height * beta / patch_size) * patch_size</pre>
+        </div>
+        <div class="prose">
+          <p>Substituting <i>h</i> = <i>r</i>·<i>w</i> into the token count gives a quadratic, <i>r</i>·<i>w</i>² + <i>r</i>·<i>w</i> = <i>N</i> − 2, whose positive root is the line above. No search, no iteration: the widest grid that keeps the aspect ratio and stays under the cap.</p>
+          <p>Very thin images get special cases so neither side rounds to zero tokens.</p>
+          <p>The release's <code>LLM.generate</code> takes token IDs or text plus images and returns tokens; the API layer (Recipe) and an HTTP server sit outside it.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="others">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Other ways to do it</span>
+        <h2>Templates, tokenizers and encoders elsewhere</h2>
+      </header>
+      <div class="compare" id="alts-frontdoor"></div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap"><div class="sources" id="sources-frontdoor"></div></div>
+  </section>
+
+</main>
+<nav class="next" aria-label="Chapter navigation">
+  <div class="wrap">
+    <a href="sampling.html"><span>← Chapter 11</span><b>Sampling, structure, determinism</b></a>
+    <a class="fwd" href="measure.html"><span>Chapter 13 →</span><b>Measuring it</b></a>
+  </div>
+</nav>
+<script src="atlas.js"></script>
+<script src="alts.js"></script>
+<script>
+(function () {
+  const { ramp, ease, clamp, lerp, rng } = Atlas;
+
+  /* ---------------- hero: the round trip ---------------- */
+  Atlas.scene("door", (g, s) => {
+    const { W, H } = g;
+    const t = s.t;
+    const lx = 30, rx = W - 30;
+    const ew = Math.min(170, W * 0.26), ex = rx - ew, ey = 56, eh = 150;
+    // inbound: protocols -> conversation
+    const protos = ["Chat Completions", "Responses", "Messages"];
+    protos.forEach((p, i) => {
+      const y = 70 + i * 36;
+      g.pill(lx, y, p, { size: 11, color: "ink-2" });
+      g.curve([lx + 132, y], [lx + 160, y], [lx + 178, 106], { color: "hair", lw: 1.5, head: 7, arrow: i === 1 });
+    });
+    const cx = lx + 182, cw = Math.max(90, ex - cx - 40);
+    g.box(cx, 86, Math.min(cw, 120), 40, { color: "memory", title: "conversation", tsize: 12, tfont: "mono", tweight: 600 });
+    g.arrow(cx + Math.min(cw, 120) + 4, 106, ex - 6, 106, { color: "hair", lw: 1.5, head: 8 });
+    // prompt strip
+    const ps = [["<｜User｜>", 1], ["Find KV size…", 0], ["<｜Assistant｜>", 1]];
+    let px = lx; const py = 204;
+    g.text("prompt, special tokens by position", lx, py - 20, { size: 11, color: "ink-3" });
+    ps.forEach(([txt, sp]) => { px += g.pill(px, py, txt, { size: 11, color: sp ? "memory" : "ink", stroke: sp ? "memory" : "hair" }) + 4; });
+    // engine
+    g.box(ex, ey, ew, eh, { color: "compute", title: "DeepInfer", sub: "IDs in · IDs out", tsize: 24, ssize: 12 });
+    // flowing token ids in
+    for (let k = 0; k < 7; k++) {
+      const u = ((t * 0.35 + k / 7) % 1);
+      const x = lerp(lx, ex - 26, u), y = 244;
+      g.rect(x, y - 8, 20, 16, { fill: k % 3 === 0 ? "memory" : "compute", r: 3, a: 0.75 * Math.sin(Math.PI * u) });
+    }
+    g.text("token IDs →", lx, 270, { size: 11, color: "ink-3" });
+    g.curve([ex - 4, 244], [ex + ew * 0.3, 244], [ex + ew * 0.3, ey + eh + 4], { color: "hair", lw: 1.2, head: 7 });
+    // outbound stream
+    const oy = H - 64;
+    g.text("← token stream, parsed into events", ex - 10, oy - 34, { size: 11, color: "ink-3", align: "right" });
+    const ev = [["reasoning", "ink-3"], ["text", "ink"], ["tool call", "ok"]];
+    const cyc = (t * 0.4) % 1;
+    for (let k = 0; k < 10; k++) {
+      const u = ((t * 0.3 + k / 10) % 1);
+      const x = lerp(ex - 8, lx + 20, u);
+      const kind = k < 4 ? 0 : k < 8 ? 1 : 2;
+      g.rect(x, oy - 22, 18, 14, { fill: ev[kind][1], r: 3, a: 0.6 * Math.sin(Math.PI * u) });
+    }
+    let ox = lx;
+    ev.forEach(([lab, c], i) => { ox += g.chip(ox, oy + 16, lab, c, { size: 12, a: 0.6 + 0.4 * (Math.floor(cyc * 3) === i ? 1 : 0) }) + 8; });
+    g.curve([ex + ew * 0.7, ey + eh], [ex + ew * 0.7, oy - 14], [ex - 6, oy - 14], { color: "hair", lw: 1.5, head: 8 });
+  }, { anim: true, restT: 2, zoom: 1.0, minW: 560 });
+
+  /* ---------------- encoding ---------------- */
+  Atlas.scene("enc", (g, s) => {
+    const { W, H, narrow } = g;
+    const a0 = s.solo(0), a1 = s.solo(1), a2 = s.solo(2);
+    const x0 = 40, x1 = W - 40;
+    if (a0 > 0.01) {
+      const reqs = [["Chat Completions", '{"messages": [ … ], "tools": [ … ]}'], ["Responses", '{"input": [ … ], "reasoning": { … }}'], ["Messages", '{"system": "…", "messages": [ … ]}']];
+      const cw = narrow ? W - 80 : W * 0.42;
+      reqs.forEach(([name, body], i) => {
+        const y = 70 + i * 84, p = ramp(s.t % 6, 0.2 + i * 0.25, 0.4);
+        g.rect(x0, y, cw, 64, { fill: "sheet", stroke: "hair", lw: 1.5, r: 8, a: a0 * p });
+        g.text(name, x0 + 14, y + 24, { size: 14, color: "ink", weight: 700, a: a0 * p });
+        g.text(body, x0 + 14, y + 46, { size: 11, color: "ink-3", a: a0 * p });
+        if (!narrow) g.curve([x0 + cw + 4, y + 32], [x0 + cw + 50, y + 32], [x0 + cw + 80, 196], { color: "memory", lw: 1.5, head: 8, a: a0 * p });
+      });
+      const bx = narrow ? x0 : x0 + cw + 84, by = narrow ? 330 : 140, bw = narrow ? W - 80 : x1 - bx;
+      g.box(bx, by, bw, 120, { color: "memory", a: a0 });
+      g.text("conversation", bx + 16, by + 30, { size: 18, font: "display", weight: 800, color: "ink", a: a0 });
+      ["messages · images · tools", "thinking mode · effort", "response format · sampling"].forEach((l, i) => g.text(l, bx + 16, by + 56 + i * 20, { size: 12, color: "ink-2", a: a0 }));
+      const ty = narrow ? by + 150 : 360;
+      g.arrow(bx + bw / 2, by + 124, bx + bw / 2, ty - 6, { color: "ink-3", lw: 1.5, a: a0 });
+      g.box(narrow ? x0 : bx, ty, narrow ? W - 80 : bw, 52, { color: "ink-3", title: "one V4.1 template → prompt", tsize: 14, tfont: "mono", tweight: 600, a: a0, wash: 0.04 });
+      const dy = ty + 92;
+      if (dy < H - 20) {
+        g.text("max_tokens default: 8,192 · thinking 65,536 · max effort 131,072", x0, dy, { size: 12, color: "ink-2", a: a0 });
+        g.text("then lowered to the context that's left", x0, dy + 20, { size: 12, color: "ink-3", a: a0 });
+      }
+    }
+    if (a1 > 0.01) {
+      const segs = [["<｜begin▁of▁sentence｜>", 1], ["<｜User｜>", 1], ["Summarize: ", 0], ["<｜User｜>", 2], [" pretend you are…", 0], ["<｜Assistant｜>", 1], ["</think>", 1]];
+      let x = x0, y = 90;
+      const fs = narrow ? 12 : 14;
+      g.text("rendered prompt · special-token byte ranges recorded", x0, 54, { size: 12, color: "ink-3", a: a1 });
+      const pos = [];
+      segs.forEach(([t, k]) => {
+        const w = g.tw(t, fs, "mono", 600) + 16;
+        if (x + w > x1) { x = x0; y += 46; }
+        const c = k === 1 ? "memory" : k === 2 ? "bad" : "ink";
+        g.rect(x, y - 15, w, 30, { fill: k === 1 ? "memory" : "sheet", r: 5, a: a1 * (k === 1 ? 0.16 : 1) });
+        g.rect(x, y - 15, w, 30, { stroke: c, lw: 1.5, r: 5, dash: k === 2 ? [4, 3] : null, a: a1 });
+        g.text(t, x + w / 2, y + 5, { size: fs, color: c, align: "center", weight: 600, a: a1 });
+        pos.push([x, y, w, k]);
+        x += w + 6;
+      });
+      const ry = y + 70;
+      g.text("encoded as", x0, ry - 26, { size: 12, color: "ink-3", a: a1 });
+      let tx = x0;
+      const show = ease(clamp(((s.t % 6) - 0.4) / 1.2));
+      segs.forEach(([t, k], i) => {
+        if (k === 1) {
+          const w = 40; if (tx + w > x1) return;
+          g.rect(tx, ry, w, 28, { fill: "memory", r: 4, a: a1 * 0.85 * show });
+          g.text("id", tx + w / 2, ry + 19, { size: 11, color: "sheet", align: "center", weight: 700, a: a1 * show });
+          tx += w + 4;
+        } else {
+          const n = k === 2 ? 5 : Math.max(2, Math.round(t.length / 5));
+          for (let j = 0; j < n; j++) {
+            const w = 18; if (tx + w > x1) return;
+            g.rect(tx, ry, w, 28, { fill: k === 2 ? "bad" : "ink-3", r: 3, a: a1 * (k === 2 ? 0.45 : 0.3) * show });
+            tx += w + 3;
+          }
+          tx += 4;
+        }
+      });
+      const ny = ry + 70;
+      g.text("■ control token → 1 special ID", x0, ny, { size: 13, color: "memory", weight: 600, a: a1 });
+      g.text("■ the same characters typed by a user → ordinary text tokens", x0, ny + 24, { size: 13, color: "bad", weight: 600, a: a1 });
+      g.text("text segments are encoded with the special vocabulary removed", x0, ny + 48, { size: 12, color: "ink-2", a: a1 });
+      g.text("token counts are illustrative", x0, ny + 72, { size: 11, color: "ink-3", a: a1 });
+    }
+    if (a2 > 0.01) {
+      const tt = (s.t % 6);
+      const segW = [0.18, 0.3, 0.12, 0.25, 0.15];
+      const bar = x1 - x0, y0 = 80;
+      g.text("prompt split at known special-token boundaries", x0, y0 - 18, { size: 12, color: "ink-3", a: a2 });
+      let x = x0;
+      segW.forEach((w, i) => {
+        g.rect(x, y0, bar * w - 14, 26, { fill: "compute", r: 4, a: a2 * 0.3 });
+        g.text("text " + (i + 1), x + 8, y0 + 18, { size: 11, color: "compute", weight: 600, a: a2 });
+        x += bar * w;
+        if (i < segW.length - 1) g.rect(x - 12, y0, 10, 26, { fill: "memory", r: 2, a: a2 * 0.9 });
+      });
+      // lanes
+      const ly = y0 + 70, lh = 32;
+      segW.forEach((w, i) => {
+        const y = ly + i * (lh + 8), p = clamp((tt - 0.5) / (w * 8));
+        g.text("worker " + (i + 1), x0, y + 21, { size: 11, color: "ink-3", a: a2 });
+        g.rect(x0 + 80, y, (bar - 80) * w * 1.6, lh, { stroke: "hair", lw: 1, r: 4, a: a2 });
+        g.rect(x0 + 80, y, (bar - 80) * w * 1.6 * p, lh, { fill: "compute", r: 4, a: a2 * 0.75 });
+      });
+      const cy = ly + segW.length * (lh + 8) + 40;
+      const done = clamp((tt - 0.5 - 0.3 * 8) / 0.8);
+      g.text("concatenate in order", x0, cy - 12, { size: 12, color: "ink-3", a: a2 });
+      g.rect(x0, cy, bar * done, 22, { fill: "compute", r: 4, a: a2 * 0.85 });
+      // timing comparison
+      const ty = cy + 64;
+      if (ty + 50 < H) {
+        const tot = segW.reduce((a, b) => a + b, 0), mx = Math.max(...segW);
+        g.text("sequential", x0, ty + 14, { size: 12, color: "ink-2", a: a2 });
+        g.rect(x0 + 110, ty, (bar - 110) * 0.9, 18, { fill: "ink-3", r: 3, a: a2 * 0.5 });
+        g.text("parallel", x0, ty + 44, { size: 12, color: "ok", weight: 600, a: a2 });
+        g.rect(x0 + 110, ty + 30, (bar - 110) * 0.9 * mx / tot, 18, { fill: "ok", r: 3, a: a2 * 0.85 });
+        g.text("longest segment, not the sum (sketch)", x0 + 120 + (bar - 110) * 0.9 * mx / tot, ty + 44, { size: 11, color: "ink-3", a: a2 });
+      }
+    }
+  }, { anim: true, restT: 4.5 });
+
+  /* ---------------- parsing ---------------- */
+  Atlas.scene("parse", (g, s) => {
+    const { W, H, narrow } = g;
+    const a0 = s.solo(0), a1 = s.solo(1), a2 = s.solo(2);
+    const x0 = 40, x1 = W - 40;
+    if (a0 > 0.01) {
+      const tt = s.t % 6;
+      const chunks = [[["E5", "B9", "B6"], "并"], [["E8"], null], [["A1", "8C"], "行"]];
+      g.text("chunks from the engine (bytes of each token)", x0, 60, { size: 12, color: "ink-3", a: a0 });
+      let x = x0;
+      const cw = narrow ? 40 : 48;
+      chunks.forEach(([bytes, ch], i) => {
+        const p = ramp(tt, 0.3 + i * 0.7, 0.3);
+        const w = bytes.length * (cw + 4) + 16;
+        g.rect(x, 80, w, 64, { stroke: "compute", lw: 1.5, r: 8, a: a0 * p });
+        g.text("token " + (i + 1), x + 8, 98, { size: 11, color: "compute", a: a0 * p });
+        bytes.forEach((b, j) => {
+          const split = (i === 1) || (i === 2 && j === 0);
+          g.rect(x + 8 + j * (cw + 4), 106, cw, 28, { fill: split ? "memory" : "compute", r: 4, a: a0 * p * (split ? 0.8 : 0.25) });
+          g.text(b, x + 8 + j * (cw + 4) + cw / 2, 125, { size: 13, color: split ? "sheet" : "compute", align: "center", weight: 700, a: a0 * p });
+        });
+        x += w + 14;
+      });
+      const by = 200;
+      const buf = tt > 1.0 && tt < 1.7 + 0.4;
+      g.box(x0, by, 220, 70, { color: "memory", title: buf ? "buffer: E8 …" : "buffer: empty", tsize: 15, tfont: "mono", tweight: 600, a: a0 });
+      g.text("E8 A1 8C is one 3-byte character", x0 + 240, by + 30, { size: 13, color: "memory", weight: 600, a: a0 });
+      g.text("split across tokens 2 and 3", x0 + 240, by + 52, { size: 13, color: "ink-2", a: a0 });
+      const oy = by + 130;
+      g.text("emitted to the parser", x0, oy - 26, { size: 12, color: "ink-3", a: a0 });
+      const out = [["并", 0.7], ["行", 2.0]];
+      let ox = x0;
+      out.forEach(([c, t0]) => { const p = ramp(tt, t0, 0.3); ox += g.pill(ox, oy, c, { size: 26, font: "body", color: "ink", a: a0 * p }) + 10; });
+      g.text("nothing half-formed is ever emitted", x0, oy + 60, { size: 13, color: "ok", weight: 600, a: a0 });
+    }
+    if (a1 > 0.01) {
+      const toks = [["We", 0], [" need", 0], [" the", 0], [" KV", 0], [" size", 0], ["</think>", 2], ["The", 1], [" tag", 1], [" <", 1], ["/", 1], ["think", 1], [">", 1], [" is", 1], [" literal", 1], ["<｜DSML｜", 3], ["tool_calls>", 4]];
+      const kinds = ["ink-3", "ink", "memory", "ok", "ok"];
+      let x = x0, y = 90; const fs = narrow ? 12 : 14;
+      const shown = Math.min(toks.length, Math.floor((s.t % 8) * 3));
+      toks.forEach(([t, k], i) => {
+        if (i >= shown) return;
+        const w = g.tw(t, fs, "mono", 600) + 14;
+        if (x + w > x1) { x = x0; y += 64; }
+        const sp = k === 2 || k === 3;
+        g.rect(x, y - 15, w, 30, { fill: sp ? kinds[k] : "sheet", r: 5, a: a1 * (sp ? 0.2 : 1) });
+        g.rect(x, y - 15, w, 30, { stroke: kinds[k], lw: sp ? 2 : 1, r: 5, a: a1 });
+        g.text(t, x + w / 2, y + 5, { size: fs, color: kinds[k], align: "center", weight: 600, a: a1 });
+        if (sp) g.text("special id", x + w / 2, y + 32, { size: 10, color: kinds[k], align: "center", a: a1 });
+        if (i >= 8 && i <= 11) g.line(x + 2, y + 20, x + w - 2, y + 20, { color: "bad", lw: 1.5, a: a1 });
+        x += w + 4;
+      });
+      const ly = y + 80;
+      const phases = [["reasoning", "ink-3"], ["text", "ink"], ["tool call", "ok"]];
+      let px = x0;
+      phases.forEach(([l, c], i) => { px += g.chip(px, ly, l, c, { size: 13, a: a1 }) + (i < 2 ? 30 : 0); if (i < 2) g.arrow(px - 26, ly, px - 6, ly, { color: "ink-3", lw: 1.2, head: 7, a: a1 }); });
+      g.text("switches happen only on special token IDs", x0, ly + 40, { size: 13, color: "memory", weight: 600, a: a1 });
+      g.text("'</think>' spelled with ordinary tokens (underlined) stays text", x0, ly + 64, { size: 13, color: "bad", a: a1 });
+      g.text("text delimiters: incremental KMP keeps match progress across chunks", x0, ly + 88, { size: 12, color: "ink-2", a: a1 });
+    }
+    if (a2 > 0.01) {
+      const tt = s.t % 8;
+      const lines = [
+        ['<｜DSML｜ invoke name="search">', 0.2, 0],
+        ['<｜DSML｜ parameter name="query" string="true">', 1.0, 1],
+        ["kv cache ", 1.8, 2], ["sizing for \"V4.1\"", 2.6, 2],
+        ["</｜DSML｜ parameter>", 3.2, 1],
+        ['<｜DSML｜ parameter name="top_k" string="false">', 3.8, 1],
+        ["5", 4.4, 2], ["</｜DSML｜ parameter>", 4.8, 1],
+      ];
+      const lw = narrow ? W - 80 : W * 0.5;
+      const fs = narrow ? 10 : 11;
+      g.text("model output (DSML)", x0, 56, { size: 12, color: "ink-3", a: a2 });
+      let y = 80;
+      lines.forEach(([t, t0, k]) => { const p = ramp(tt, t0, 0.3); g.text(t, x0 + (k === 2 ? 24 : k === 1 ? 12 : 0), y, { size: fs, color: k === 2 ? "ink" : "memory", weight: k === 2 ? 600 : 500, a: a2 * p }); y += 24; });
+      const rx = narrow ? x0 : x0 + lw + 30, ry0 = narrow ? y + 30 : 80;
+      g.text("streamed to the client", rx, ry0 - 24, { size: 12, color: "ink-3", a: a2 });
+      const frags = [['name: "search"', 0.5], ['{"query":"', 1.3], ["kv cache ", 2.0], ['sizing for \\"V4.1\\"', 2.8], ['"', 3.4], [',"top_k":', 4.0], ["5", 4.6], ["}", 5.0]];
+      let fy = ry0;
+      frags.forEach(([f, t0], i) => {
+        const p = ramp(tt, t0, 0.3);
+        const w = g.tw(f, fs + 1, "mono", 600) + 16;
+        g.rect(rx, fy - 13, w, 24, { fill: i === 0 ? "ok" : "sheet", stroke: "ok", lw: 1.2, r: 5, a: a2 * p * (i === 0 ? 0.25 : 1) });
+        g.text(f, rx + 8, fy + 4, { size: fs + 1, color: "ok", weight: 600, a: a2 * p });
+        fy += 30;
+      });
+      const ny = Math.max(y, fy) + 30;
+      if (ny < H - 30) {
+        g.text("strings: JSON-escaped piece by piece (note the \\\")", x0, ny, { size: 12, color: "ink-2", a: a2 });
+        g.text("string=\"false\" values: passed through as JSON text", x0, ny + 22, { size: 12, color: "ink-2", a: a2 });
+      }
+    }
+  }, { anim: true, restT: 6.5 });
+
+  /* ---------------- vision ---------------- */
+  Atlas.scene("vis", (g, s) => {
+    const { W, H, narrow } = g;
+    const a0 = s.solo(0), a1 = s.solo(1), a2 = s.solo(2), a3 = s.solo(3);
+    const x0 = 40, x1 = W - 40;
+    if (a0 > 0.01) {
+      const ex = ease(clamp(((s.t % 6) - 0.6) / 1.4));
+      let x = x0; const y = 80;
+      ["<｜User｜>", "What's in", "<image>", "?"].forEach((t, i) => {
+        const img = i === 2;
+        x += g.pill(x, y, t, { size: 14, color: img ? "net" : i === 0 ? "memory" : "ink", stroke: img ? "net" : i === 0 ? "memory" : "hair", a: a0 * (img ? 1 - 0.6 * ex : 1) }) + 6;
+      });
+      const gw = 7, gh = 4, cs = Math.min(40, (x1 - x0 - 60) / (gw + 3));
+      const gx = x0 + 20, gy = 150;
+      // start token
+      g.rect(gx, gy, cs - 4, cs - 4, { fill: "net", r: 4, a: a0 * ex });
+      g.text("start", gx + cs / 2 - 2, gy + cs + 10, { size: 10, color: "net", align: "center", a: a0 * ex });
+      for (let r = 0; r < gh; r++) {
+        for (let c = 0; c <= gw; c++) {
+          const k = r * (gw + 1) + c, p = ramp(ex * 40, k * 0.9, 1.5);
+          const xx = gx + (c + 1.5) * cs, yy = gy + r * cs;
+          if (c < gw) g.rect(xx, yy, cs - 4, cs - 4, { fill: "net", r: 3, a: a0 * p * 0.45 });
+          else { g.rect(xx, yy, cs - 4, cs - 4, { stroke: "ink-3", lw: 1.5, r: 3, a: a0 * p }); g.text("↵", xx + cs / 2 - 2, yy + cs / 2 + 4, { size: 14, color: "ink-3", align: "center", a: a0 * p }); }
+        }
+      }
+      g.rect(gx + (gw + 2.5) * cs, gy + (gh - 1) * cs, cs - 4, cs - 4, { fill: "net", r: 4, a: a0 * ex });
+      g.text("end", gx + (gw + 2.5) * cs + cs / 2 - 2, gy + gh * cs + 10, { size: 10, color: "net", align: "center", a: a0 * ex });
+      const ty = gy + gh * cs + 50;
+      g.text("h × (w + 1) + 2", x0, ty, { size: 24, font: "display", weight: 800, color: "ink", a: a0 });
+      g.text(`here: ${gh} × (${gw} + 1) + 2 = ${gh * (gw + 1) + 2} tokens`, x0, ty + 30, { size: 13, color: "ink-2", a: a0 });
+      g.text("↵ newline tokens mark row ends: the LLM's positions are 1-D", x0, ty + 56, { size: 13, color: "ink-3", a: a0 });
+    }
+    if (a1 > 0.01) {
+      const iw = narrow ? W - 80 : Math.min(W * 0.55, (H - 160) * 1.5), ih = iw / 1.5;
+      const ix = x0, iy = 70;
+      // a simple picture
+      g.rect(ix, iy, iw, ih, { fill: "net", r: 4, a: a1 * 0.12 });
+      g.poly([[ix, iy + ih * 0.75], [ix + iw * 0.3, iy + ih * 0.35], [ix + iw * 0.5, iy + ih * 0.6], [ix + iw * 0.72, iy + ih * 0.25], [ix + iw, iy + ih * 0.7], [ix + iw, iy + ih], [ix, iy + ih]], { fill: Atlas.rgba("net", 0.35), close: true, a: a1 });
+      g.circle(ix + iw * 0.8, iy + ih * 0.2, ih * 0.08, { fill: "memory", a: a1 * 0.8 });
+      const pcols = 18, pr = 12, pw = iw / pcols;
+      const showP = ramp(s.t % 6, 0.3, 0.5), merge = ease(clamp(((s.t % 6) - 1.6) / 1.0));
+      for (let c = 1; c < pcols; c++) g.line(ix + c * pw, iy, ix + c * pw, iy + ih, { color: "ink-3", lw: c % 3 === 0 ? 1.8 : 0.6, a: a1 * showP * (c % 3 === 0 ? 0.3 + 0.5 * merge : 0.5 * (1 - merge * 0.7)) });
+      for (let r = 1; r < pr; r++) g.line(ix, iy + r * ih / pr, ix + iw, iy + r * ih / pr, { color: "ink-3", lw: r % 3 === 0 ? 1.8 : 0.6, a: a1 * showP * (r % 3 === 0 ? 0.3 + 0.5 * merge : 0.5 * (1 - merge * 0.7)) });
+      g.rect(ix + 3 * pw, iy + 3 * ih / pr, 3 * pw, 3 * ih / pr, { stroke: "compute", lw: 3, r: 2, a: a1 * merge });
+      const tx = narrow ? x0 : ix + iw + 30, ty = narrow ? iy + ih + 40 : iy + 20;
+      const items = [["14 × 14 px", "one vision-encoder patch", "ink-2"], ["3 × 3 patches", "merged into one LLM token", "compute"], ["42 × 42 px", "per token", "compute"], ["≤ 1,024", "tokens per image", "ink"], ["≥ 295,936 px", "smaller images scaled up", "ink-2"]];
+      items.forEach(([a_, b_, c], i) => { g.text(a_, tx, ty + i * 46, { size: 18, font: "display", weight: 800, color: c, a: a1 }); g.text(b_, tx, ty + i * 46 + 18, { size: 12, color: "ink-3", a: a1 }); });
+      g.text("vision encoder: 32 layers, width 1,024", x0, iy + ih + (narrow ? 270 : 34), { size: 12, color: "ink-3", a: a1 });
+    }
+    if (a2 > 0.01) {
+      const tt = s.t % 7;
+      g.box(x0, 60, 170, 64, { color: "ink-3", title: "engine", sub: "scheduler", tsize: 18, ssize: 12, a: a2, wash: 0.05 });
+      const wx = x0 + 230, ww = x1 - wx;
+      for (let k = 0; k < 3; k++) {
+        const y = 50 + k * 50;
+        g.rect(wx, y, ww * 0.5, 38, { fill: "cpu", r: 6, a: a2 * 0.2 }); g.rect(wx, y, ww * 0.5, 38, { stroke: "cpu", lw: 1.5, r: 6, a: a2 });
+        g.text("worker " + (k + 1) + " · decode, resize", wx + 10, y + 24, { size: 12, color: "cpu", weight: 600, a: a2 });
+      }
+      g.box(wx + ww * 0.58, 50, ww * 0.42, 138, { color: "memory", title: "pinned", sub: "shared-memory pool", tsize: 16, ssize: 12, a: a2 });
+      for (let k = 0; k < 3; k++) { const u = ((tt * 0.4 + k * 0.33) % 1); g.rect(lerp(wx + ww * 0.5, wx + ww * 0.58, u) - 6, 62 + k * 50, 12, 12, { fill: "memory", r: 2, a: a2 * Math.sin(Math.PI * u) }); }
+      g.curve([x0 + 172, 92], [x0 + 200, 70], [wx - 4, 69], { color: "ink-3", lw: 1.5, head: 8, a: a2 });
+      g.text("requests wait until their images are ready · stalled workers detected", x0, 230, { size: 12, color: "ink-2", a: a2 });
+      // cached prefix
+      const cy = 290, bar = x1 - x0;
+      g.text("prompt tokens, with the KV-cache hit as a prefix", x0, cy - 14, { size: 12, color: "ink-3", a: a2 });
+      const spans = [[0.08, 0.2], [0.42, 0.18], [0.7, 0.2]];
+      g.rect(x0, cy, bar, 34, { fill: "grid", r: 4, a: a2 });
+      spans.forEach(([st, w], i) => g.rect(x0 + bar * st, cy, bar * w, 34, { fill: "net", r: 3, a: a2 * 0.55 }));
+      const hit = 0.52;
+      g.rect(x0, cy - 6, bar * hit, 46, { stroke: "ok", lw: 2.5, r: 6, a: a2 });
+      g.text("cached", x0 + 8, cy + 56, { size: 12, color: "ok", weight: 600, a: a2 });
+      g.text("image 1", x0 + bar * 0.08 + 6, cy + 22, { size: 11, color: "sheet", weight: 700, a: a2 });
+      g.text("image 2", x0 + bar * 0.42 + 6, cy + 22, { size: 11, color: "sheet", weight: 700, a: a2 });
+      g.text("image 3", x0 + bar * 0.7 + 6, cy + 22, { size: 11, color: "sheet", weight: 700, a: a2 });
+      g.text("image 1: fully covered → bytes dropped, never sent to a worker", x0, cy + 86, { size: 13, color: "ok", a: a2 });
+      g.text("image 2: the hit ends inside it → still processed", x0, cy + 110, { size: 13, color: "ink-2", a: a2 });
+    }
+    if (a3 > 0.01) {
+      const pf = [["prefill A", 0], ["prefill B", 1]];
+      pf.forEach(([l], i) => g.box(x0, 70 + i * 90, 150, 60, { color: "compute", title: l, tsize: 16, tfont: "mono", tweight: 600, a: a3 }));
+      const vx = narrow ? x0 + 190 : W * 0.42, vw = x1 - vx;
+      const loads = [[3, 1.2], [1, 0.4], [2, 0.8], [4, 1.6]];
+      g.text("one vision-encoder machine · one encoder per GPU", vx, 56, { size: 12, color: "ink-3", a: a3 });
+      const pick = 1;
+      loads.forEach(([n, l], k) => {
+        const y = 70 + k * 52;
+        g.rect(vx, y, vw, 40, { fill: "net", r: 6, a: a3 * (k === pick ? 0.22 : 0.08) });
+        g.rect(vx, y, vw, 40, { stroke: k === pick ? "ok" : "net", lw: k === pick ? 2.5 : 1.2, r: 6, a: a3 });
+        g.text("GPU " + k, vx + 10, y + 25, { size: 12, color: "net", weight: 600, a: a3 });
+        for (let j = 0; j < n; j++) g.rect(vx + 70 + j * 34, y + 10, 28, 20, { fill: "net", r: 3, a: a3 * 0.6 });
+        g.text(`${Math.round(l * 1000)} pending patches`, vx + vw - 10, y + 25, { size: 11, color: k === pick ? "ok" : "ink-3", align: "right", weight: k === pick ? 700 : 500, a: a3 });
+      });
+      const tt = s.t % 5, u = ease(clamp((tt - 0.6) / 1.2));
+      g.curve([x0 + 152, 100], [lerp(x0 + 152, vx, 0.5), 60], [vx - 4, 70 + pick * 52 + 20], { color: "ok", lw: 2, head: 9, a: a3, prog: u });
+      g.text("random machine, then the GPU with the fewest pending patches", x0, 70 + 4 * 52 + 30, { size: 13, color: "ok", weight: 600, a: a3 });
+      g.text("patches = (width ÷ 14) × (height ÷ 14)", x0, 70 + 4 * 52 + 54, { size: 13, color: "ink-2", a: a3 });
+      g.text("production deployment; not part of the release", x0, 70 + 4 * 52 + 80, { size: 12, color: "ink-3", a: a3 });
+    }
+  }, { anim: true, restT: 4 });
+
+  /* ---------------- image token lab ---------------- */
+  const P = 14, RD = 3, NMAX = 1024, MINPX = 295936;
+  function fromPixels(bw, bh) {
+    const nvh = Math.floor(bh / P), nvw = Math.floor(bw / P);
+    const nlh = Math.ceil(nvh / RD), nlw = Math.ceil(nvw / RD);
+    return { bw, bh, nvw, nvh, nlw, nlh, tokens: nlh * (nlw + 1) + 2 };
+  }
+  function solve(h, w) {
+    const r = h / w, mwf = Math.sqrt((NMAX - 2) / r + 0.25) - 0.5, mhf = mwf * r;
+    let bw, bh;
+    if (mwf < 1) { const mw = 1, mh = Math.floor((NMAX - 2) / (mw + 1)); bw = mw * P * RD; bh = mh * P * RD; }
+    else if (mhf < 1) { const mh = 1, mw = Math.floor((NMAX - 2) / mh) - 1; bw = mw * P * RD; bh = mh * P * RD; }
+    else { const mw = Math.floor(mwf), mh = Math.floor(mhf), beta = Math.min(mw * P * RD / w, mh * P * RD / h); bw = Math.floor(w * beta / P) * P; bh = Math.floor(h * beta / P) * P; }
+    return fromPixels(bw, bh);
+  }
+  function layout(w0, h0) {
+    let w = w0, h = h0, up = false, capped = false;
+    if (w * h < MINPX) { const ratio = Math.sqrt(MINPX / (w * h)); w = Math.floor(w * ratio); h = Math.floor(h * ratio); up = true; }
+    let L = fromPixels(Math.ceil(w / P) * P, Math.ceil(h / P) * P);
+    if (L.tokens > NMAX) { L = solve(h, w); capped = true; }
+    return Object.assign(L, { up, capped });
+  }
+  Atlas.scene("imgtok", (g, s) => {
+    const st = s.state; if (st.iw === undefined) return;
+    const { W, H } = g;
+    const L = layout(st.iw, st.ih);
+    document.getElementById("im-tok").textContent = L.tokens.toLocaleString("en-US");
+    document.getElementById("im-size").textContent = `${L.bw} × ${L.bh}`;
+    document.getElementById("im-note").textContent = L.capped ? `Over 1,024 tokens as is, so it is shrunk to the largest grid that fits: ${L.nlw} × ${L.nlh} tokens.` : L.up ? `Below 295,936 pixels, so it is scaled up first, then rounded to 14-pixel multiples.` : `Fits as is after rounding up to 14-pixel multiples: ${L.nlw} × ${L.nlh} tokens plus ${L.nlh} newlines and 2 markers.`;
+    const pad = 40, aw = W - 2 * pad - 50, ah = H - 2 * pad - 30;
+    const sc = Math.min(aw / L.bw, ah / L.bh);
+    const iw = L.bw * sc, ih = L.bh * sc, ix = pad, iy = pad;
+    // picture
+    g.rect(ix, iy, iw, ih, { fill: "net", a: 0.12 });
+    g.poly([[ix, iy + ih * 0.78], [ix + iw * 0.28, iy + ih * 0.4], [ix + iw * 0.52, iy + ih * 0.66], [ix + iw * 0.74, iy + ih * 0.3], [ix + iw, iy + ih * 0.72], [ix + iw, iy + ih], [ix, iy + ih]], { fill: Atlas.rgba("net", 0.3), close: true });
+    g.circle(ix + iw * 0.82, iy + ih * 0.22, Math.min(iw, ih) * 0.07, { fill: "memory", a: 0.7 });
+    // token grid (42 px)
+    const tpx = P * RD * sc;
+    if (tpx >= 3) {
+      for (let c = 1; c < L.nlw; c++) g.line(ix + c * tpx, iy, ix + c * tpx, iy + ih, { color: "compute", lw: 1, a: 0.55 });
+      for (let r = 1; r < L.nlh; r++) g.line(ix, iy + r * tpx, ix + iw, iy + r * tpx, { color: "compute", lw: 1, a: 0.55 });
+    }
+    if (P * sc >= 5) {
+      for (let c = 1; c < L.nvw; c++) if (c % RD) g.line(ix + c * P * sc, iy, ix + c * P * sc, iy + ih, { color: "ink-3", lw: 0.5, a: 0.25 });
+      for (let r = 1; r < L.nvh; r++) if (r % RD) g.line(ix, iy + r * P * sc, ix + iw, iy + r * P * sc, { color: "ink-3", lw: 0.5, a: 0.25 });
+    }
+    g.rect(ix, iy, iw, ih, { stroke: "compute", lw: 2 });
+    // newline column
+    const nlh = Math.min(L.nlh, 200), rh = ih / L.nlh;
+    for (let r = 0; r < nlh; r++) g.rect(ix + iw + 8, iy + r * rh + Math.min(1, rh * 0.1), 14, Math.max(1, rh - 2), { fill: "ink-3", r: 2, a: 0.45 });
+    g.text("↵", ix + iw + 15, iy - 8, { size: 12, color: "ink-3", align: "center" });
+    g.text(`${L.nlw} × ${L.nlh} tokens of 42 px · ${L.nlh} newlines · start + end = ${L.tokens}`, ix, iy + ih + 26, { size: 12, color: "ink-2" });
+  }, { controls: "img-ctl", format: (id, v) => String(v) });
+})();
+
+</script>
+<script>AtlasAlts.render("alts-frontdoor", "sources-frontdoor", "frontdoor");</script>
+</body>
+</html>

@@ -1,0 +1,528 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Numbers and kernels · DeepInfer Annotated</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&display=swap">
+<link rel="stylesheet" href="atlas.css">
+</head>
+<body>
+<header class="bar">
+  <div class="wrap">
+    <a class="brand" href="index.html"><b>DeepInfer</b><span>annotated</span></a>
+    <nav aria-label="Chapters">
+      <a class="num" href="loop.html" title="The generation loop">01</a>
+      <a class="num" href="model.html" title="The model it serves">02</a>
+      <a class="num" href="engine.html" title="Anatomy of the engine">03</a>
+      <a class="num" href="memory.html" title="KV memory">04</a>
+      <a class="num" href="scheduling.html" title="Scheduling a step">05</a>
+      <a class="num" href="parallelism.html" title="One model, many GPUs">06</a>
+      <a class="num" href="cluster.html" title="The cluster around it">07</a>
+      <a class="num" href="replay.html" title="Bounded replay">08</a>
+      <a class="num" href="speculation.html" title="Speculative decoding">09</a>
+      <a class="num" href="kernels.html" aria-current="page" title="Numbers and kernels">10</a>
+      <a class="num" href="sampling.html" title="Sampling, structure, determinism">11</a>
+      <a class="num" href="frontdoor.html" title="The front door">12</a>
+      <a class="num" href="measure.html" title="Measuring it">13</a>
+      <a href="index.html">Map</a>
+    </nav>
+  </div>
+  <div class="progress"></div>
+</header>
+<main>
+  <section class="hero">
+    <div class="wrap">
+      <div>
+        <span class="eyebrow"><span class="n">10</span> Silicon</span>
+        <h1>Numbers <em>and kernels</em></h1>
+        <p class="dek">Below the scheduler, everything is bytes and tiles. V4.1 keeps weights and KV in 8 and 4 bits with shared scales, and DeepInfer runs on DeepSeek's own kernel libraries, on two kinds of hardware.</p>
+        <div class="files">
+          <span class="tag">scripts/build_vendor.sh</span>
+          <span class="tag">layers/tilelang_ops/cuda/</span>
+          <span class="tag">layers/tilelang_ops/asc/</span>
+          <span class="tag">deep_cluster/topology/bind.py</span>
+        </div>
+      </div>
+      <div class="board stage-card" data-stage="micro" data-label="Thirty-two values scattered along a number line slide onto the few levels FP4 can represent and stack up, after one power-of-two scale is chosen from the largest value.">
+        <span class="ruler">MXFP4 · 32 values · 1 shared scale</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <div class="facts">
+        <div><b>FP8 32×32</b><span>weight blocks with power-of-two (ue8m0) scales</span></div>
+        <div><b>MXFP4</b><span>routed-expert weights and indexer KV: 32 values per E8M0 scale</span></div>
+        <div><b>FP4 + e4m3/16</b><span>main KV: like NVFP4, without the global scale</span></div>
+        <div><b>4 + 2</b><span>vendored kernel libraries: DeepSelect, FlashMLA, DeepEP, DeepGEMM, plus Ascend ports of the last two</span></div>
+        <div><b>2</b><span>platforms: NVIDIA SM100 and Huawei Ascend 950</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="formats">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Number formats</span>
+        <h2>Fewer bits, shared scales</h2>
+        <p class="lede">Decode reads bytes. Halving the bytes nearly halves the time, as long as the numbers stay accurate enough.</p>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">Bytes are time</span><h4>Each halving pays twice</h4><p>A memory-bound step costs bytes read ÷ bandwidth. Going from 16-bit to 8-bit weights halves the bytes; 4-bit halves them again. Smaller weights also leave more HBM for KV, which means bigger batches.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Block scaling</span><h4>One scale per block of values</h4><p>A low-bit number has a tiny range, so values are stored relative to a scale shared by a block. V4.1's FP8 weights use 32×32 blocks; their scales are <i>ue8m0</i>: an 8-bit exponent with no mantissa, so every scale is an exact power of two and rescaling is just exponent arithmetic.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Four bits</span><h4>Eight magnitudes and a sign</h4><p>FP4 (E2M1) can represent only 0, 0.5, 1, 1.5, 2, 3, 4 and 6, plus a sign. MXFP4 groups 32 such values under one power-of-two scale; V4.1 uses it for routed-expert weights and the indexer's keys. The main KV cache uses FP4 values with an FP8 (e4m3) scale per 16 values: finer, more accurate scales.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">What it buys</span><h4>Bytes per value, all in</h4><p>Counting the scales, BF16 costs 16 bits per value, FP8 with 32×32 blocks about 8.01, MXFP4 4.25, and FP4 with an e4m3 scale per 16 values 4.5. Experts dominate weight bytes, KV dominates per-request bytes; both go to about 4 bits.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="fmt" data-label="Bars showing bytes per value for BF16, FP8, MXFP4 and FP4; a block of values sharing one scale; the FP4 number line with its eight magnitudes; a table of bits per value including scales."><span class="ruler">bits per value</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="lab">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Try it</span>
+        <h2>Quantize a block</h2>
+        <p class="lede">One outlier stretches the scale for its whole block and crushes its neighbors. Smaller blocks and finer scales limit the damage.</p>
+      </header>
+      <div class="lab">
+        <div class="controls" id="q-ctl">
+          <div class="ctl"><label>Element format</label>
+            <div class="seg" id="qfmt"><button type="button" value="fp4" aria-pressed="true">FP4 (E2M1)</button><button type="button" value="fp8" aria-pressed="false">FP8 (E4M3)</button></div>
+          </div>
+          <div class="ctl"><label>Scale format</label>
+            <div class="seg" id="qscale"><button type="button" value="ue8m0" aria-pressed="true">power of two (ue8m0)</button><button type="button" value="e4m3" aria-pressed="false">FP8 (e4m3)</button></div>
+          </div>
+          <div class="ctl"><label for="qblock">Values per scale <output for="qblock">32</output></label><input type="range" id="qblock" min="3" max="7" step="1" value="5"></div>
+          <div class="ctl"><label for="qout">Outlier size (× typical) <output for="qout">12</output></label><input type="range" id="qout" min="1" max="40" step="1" value="12"></div>
+          <div class="readout">
+            <div><b id="q-err">–</b><span>relative RMS error</span></div>
+            <div><b id="q-bits">–</b><span>bits per value incl. scales</span></div>
+          </div>
+        </div>
+        <div class="board" data-stage="quant" data-label="128 values as thin bars with their quantized versions overlaid, grouped into scale blocks; the outlier's block shows its small values collapsing to zero."><span class="ruler">original vs quantized · 128 values</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="kernels">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Kernels</span>
+        <h2>A shelf of DeepSeek libraries</h2>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">The libraries</span><h4>Each one owns a hot loop</h4><p><b>FlashMLA</b> runs the attention, including the sparse and compressed paths. <b>DeepGEMM</b> runs the FP8/FP4 matrix multiplies, from dense projections to grouped expert GEMMs. <b>DeepEP</b> moves tokens to experts and back, and fetches Engram rows held by other ranks. <b>DeepSelect</b> does top-k for the indexer and the sampler. <b>TileKernels</b> (a pip package) supplies fused SwiGLU-plus-quantize (and MoE gating on Ascend), and the repo adds about 30 <b>TileLang</b> ops of its own.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Mega MoE</span><h4>One kernel for the whole MoE layer</h4><p>An unfused MoE layer runs dispatch, two expert GEMMs, the activation and combine as separate steps after the gate, with intermediates going through memory in between. When the whole expert-parallel group sits inside one NVLink domain, DeepInfer runs the gate (itself a fused DeepGEMM call on GPUs) and then a single DeepGEMM <i>mega MoE</i> kernel for everything else: tokens move through symmetric memory, the shared expert can be folded in, and expert loads are counted for EPLB on the way. DeepSeek reports it is significantly faster than unfused MoE at every EP size and batch size in that setting.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">TileLang</span><h4>One op, two backends</h4><p>Engine-specific kernels (sampling, KV stores, state-cache copies, window indexing, the zero-overhead-scheduling gathers, draft scheduling, grammar masks) are written in TileLang. There are about 29 per backend; most exist in both <code>cuda/</code> and <code>asc/</code>, a few in only one. <code>ops.py</code> imports whichever backend the platform names and raises a clear error if a kernel is missing there; the top-level file holds the wrapper and, for nearly every op, its reference tests.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Two platforms</span><h4>SM100 and Ascend 950</h4><p>The same engine builds for NVIDIA SM100 (CUDA 13) or Huawei Ascend 950 (CANN 9.2), chosen by <code>DEEPINFER_ACCELERATOR</code>. FlashMLA and DeepSelect compile for either target; DeepEP and DeepGEMM have Ascend ports. <code>deep_cluster</code> looks up the NUMA node of each process's accelerator (or InfiniBand card) and binds both its CPU threads and its memory there.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="shelf" data-label="The engine on top of its kernel libraries mapped to the operations they serve; an unfused MoE pipeline after the gate collapsing into one mega MoE kernel; a TileLang op forking into cuda and asc files; the two hardware platforms and NUMA binding."><span class="ruler">engine → kernels → silicon</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="code">
+    <div class="wrap stack">
+      <header>
+        <span class="eyebrow">In the repo</span>
+        <h2>Scales as raw exponents</h2>
+      </header>
+      <div class="split">
+        <div class="code">
+          <div class="hd"><span>models/v4_modules/engram.py</span><a href="https://github.com/deepseek-ai/DeepInfer/blob/main/deepinfer/model_executor/models/v4_modules/engram.py" target="_blank" rel="noopener">source</a></div>
+<pre><span class="c">"""Pack the ue8m0 scales represented in fp32 into</span>
+<span class="c">int32 (CUDA) / int16 (ASC), 4/2 per group."""</span>
+<span class="k">assert</span> x.dtype == torch.float32 <span class="k">and</span> x.size(-<span class="n">1</span>) % <span class="n">4</span> == <span class="n">0</span>
+x_int32 = x.view(torch.int32)
+<span class="c"># a power of two has an all-zero mantissa</span>
+<span class="k">assert</span> (x_int32 &gt;= <span class="n">0</span>).all() <span class="k">and</span> (x_int32 &amp; <span class="n">0x7FFFFF</span> == <span class="n">0</span>).all()
+<span class="c"># keep only the 8 exponent bits</span>
+<span class="k">return</span> torch.floor_divide(x_int32, <span class="n">1</span> &lt;&lt; <span class="n">23</span>).to(torch.uint8).view(PLATFORM.fp8_sf_type)</pre>
+        </div>
+        <div class="prose">
+          <p>A ue8m0 scale is literally the exponent byte of a float32 whose mantissa is zero. The code checks the mantissa bits are clear, shifts the exponent down 23 bits and packs four of them per 32-bit word on CUDA, or two per 16-bit word on Ascend.</p>
+          <p>The model loader insists on this layout: the config must say FP8 with 32×32 weight blocks, FP4 experts, dynamic activation scaling and ue8m0 scales, or it refuses to load.</p>
+          <p>DeepSeek notes that its internal FlashMLA has one extra hand-tuned SASS optimization, making the decode kernel 5–10% faster; end to end the public and internal stacks are within 5%.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="others">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Other ways to do it</span>
+        <h2>Formats and kernels elsewhere</h2>
+      </header>
+      <div class="compare" id="alts-kernels"></div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap"><div class="sources" id="sources-kernels"></div></div>
+  </section>
+
+</main>
+<nav class="next" aria-label="Chapter navigation">
+  <div class="wrap">
+    <a href="speculation.html"><span>← Chapter 09</span><b>Speculative decoding</b></a>
+    <a class="fwd" href="sampling.html"><span>Chapter 11 →</span><b>Sampling, structure, determinism</b></a>
+  </div>
+</nav>
+<script src="atlas.js"></script>
+<script src="alts.js"></script>
+<script>
+(function () {
+  const { ramp, ease, clamp, lerp, rng } = Atlas;
+  const FP4 = [0, 0.5, 1, 1.5, 2, 3, 4, 6];
+  function q4(v) { // nearest E2M1 magnitude, keep sign
+    const m = Math.abs(v); let best = 0, d = 1e9;
+    FP4.forEach((l) => { if (Math.abs(m - l) < d) { d = Math.abs(m - l); best = l; } });
+    return Math.sign(v) * best;
+  }
+  function q8(v) { // nearest E4M3 (OCP fn variant, max 448)
+    const m = Math.abs(v); if (m === 0) return 0;
+    const e = Math.max(-6, Math.floor(Math.log2(m))), step = Math.pow(2, e - 3);
+    return Math.sign(v) * Math.min(448, Math.round(m / step) * step);
+  }
+  function gauss(R) { const u = Math.max(1e-9, R()), v = R(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+  function quantize(xs, block, elem, scaleFmt) {
+    const maxE = elem === "fp4" ? 6 : 448, qe = elem === "fp4" ? q4 : q8;
+    const out = [], scales = [];
+    for (let b0 = 0; b0 < xs.length; b0 += block) {
+      const blk = xs.slice(b0, b0 + block), amax = Math.max(...blk.map(Math.abs), 1e-12);
+      let sc = amax / maxE;
+      sc = scaleFmt === "ue8m0" ? Math.pow(2, Math.ceil(Math.log2(sc))) : q8(sc) || sc;
+      if (amax / sc > maxE * 1.0001) sc = amax / maxE; // keep in range if e4m3 rounding dipped
+      scales.push(sc);
+      blk.forEach((v) => out.push(qe(v / sc) * sc));
+    }
+    return { out, scales };
+  }
+
+  /* ---------------- hero: a block snapping to FP4 ---------------- */
+  Atlas.scene("micro", (g, s) => {
+    const { W, H } = g;
+    const cyc = 6.5, k = Math.floor(s.t / cyc), tt = s.t % cyc;
+    const R = rng(11 + k);
+    const xs = []; for (let i = 0; i < 32; i++) xs.push(gauss(R) * (0.6 + 0.5 * R()));
+    const amax = Math.max(...xs.map(Math.abs)), e = Math.ceil(Math.log2(amax / 6)), sc = Math.pow(2, e);
+    const x0 = 46, x1 = W - 46, ly = H - 74, sx = (v) => (x0 + x1) / 2 + (v / 6.4) * (x1 - x0) / 2;
+    const ph = ease(clamp((tt - 2.2) / 1.1)), showLv = ramp(tt, 1.2, 0.5);
+    // number line + representable levels
+    g.line(x0, ly, x1, ly, { color: "ink-3", lw: 1.5 });
+    const lv = []; FP4.forEach((l) => { lv.push(l); if (l) lv.push(-l); });
+    lv.forEach((l) => {
+      g.line(sx(l), ly - 6, sx(l), ly + 6, { color: "compute", lw: 2, a: 0.35 + 0.65 * showLv });
+      if (Math.abs(l) % 1 === 0 || Math.abs(l) === 0.5 && false) g.text(String(l), sx(l), ly + 26, { size: 12, color: "compute", align: "center", weight: 600, a: showLv });
+    });
+    // stack heights per level after snapping
+    const stack = new Map(), r = Math.min(7, (H - 140) / 22);
+    const bySnap = xs.map((v) => { const q = q4(v / sc); const c = stack.get(q) || 0; stack.set(q, c + 1); return [q, c]; });
+    xs.forEach((v, i) => {
+      const xv = v / sc, [q, c] = bySnap[i];
+      const yScatter = ly - 30 - ((i * 7) % 16) * (r * 1.25) - 6;
+      const ySnap = ly - 14 - c * (r * 2.3);
+      const x = lerp(sx(xv), sx(q), ph), y = lerp(yScatter, ySnap, ph);
+      const isMax = Math.abs(v) === amax;
+      const appear = ramp(tt, 0.05 + i * 0.02, 0.25);
+      g.circle(x, y, r, { fill: isMax ? "memory" : "compute", a: appear * (isMax ? 1 : 0.8) });
+      if (ph > 0.05 && ph < 0.999) g.line(sx(xv), yScatter, x, y, { color: "compute", lw: 1, a: 0.25 * (1 - ph) });
+    });
+    // amax marker
+    const mx = sx(xs.find((v) => Math.abs(v) === amax) / sc);
+    const ma = ramp(tt, 1.0, 0.4) * (1 - ramp(tt, 5.6, 0.5));
+    g.line(sx(6), 86, sx(6), ly, { color: "memory", lw: 1.5, dash: [4, 4], a: ma });
+    g.line(sx(-6), 86, sx(-6), ly, { color: "memory", lw: 1.5, dash: [4, 4], a: ma });
+    g.text("|x| ÷ scale ≤ 6", sx(6) - 6, 66, { size: 12, color: "memory", align: "right", weight: 600, a: ma });
+    const lab = tt < 1.2 ? "32 values from one block" : tt < 2.2 ? "the largest |x| picks a power-of-two scale" : "each value snaps to the nearest FP4 level";
+    g.text(lab, x0, H - 16, { size: 13, color: "ink-2" });
+    g.chip(x0, 62, `scale = 2^${e}  (1 byte)`, "memory", { size: 13, a: ramp(tt, 1.2, 0.4) });
+    void mx;
+  }, { anim: true, restT: 4.2, zoom: 1.0, minW: 540 });
+
+  /* ---------------- formats ---------------- */
+  Atlas.scene("fmt", (g, s) => {
+    const { W, H, narrow } = g;
+    const a0 = s.solo(0), a1 = s.solo(1), a2 = s.solo(2), a3 = s.solo(3);
+    if (a0 > 0.01) {
+      const x0 = 150, x1 = W - 40, bw = x1 - x0;
+      g.text("same weights, three precisions · one GPU's HBM (illustrative)", 40, 60, { size: 13, color: "ink-3", a: a0 });
+      [["BF16", 16, 0.72], ["FP8", 8, 0.36], ["FP4", 4, 0.18]].forEach(([lab, bits, frac], i) => {
+        const y = 100 + i * Math.max(96, (H - 200) / 3);
+        const grow = ease(clamp((s.t % 6 - 0.3 - i * 0.25) / 0.8));
+        g.text(lab, 40, y + 30, { size: 24, font: "display", weight: 800, color: "ink", a: a0 });
+        g.text(bits + " bits", 40, y + 50, { size: 12, color: "ink-3", a: a0 });
+        g.rect(x0, y, bw, 44, { stroke: "hair", lw: 1.5, r: 6, a: a0 });
+        g.rect(x0, y, bw * frac, 44, { fill: "memory", r: 6, a: a0 * 0.85 });
+        g.text("weights", x0 + 10, y + 27, { size: 13, color: "sheet", weight: 600, a: a0 });
+        g.rect(x0 + bw * frac + 4, y, (bw * (1 - frac) - 4) * grow, 44, { fill: "net", r: 6, a: a0 * 0.35 });
+        const kvLab = bw * (1 - frac) > g.tw("room for KV → bigger batches", 13, "mono", 600) + 30 ? "room for KV → bigger batches" : "KV";
+        g.text(kvLab, x0 + bw * frac + 14, y + 27, { size: 13, color: "net", weight: 600, a: a0 * grow });
+        g.rect(x0, y + 52, bw * frac * 0.5, 8, { fill: "compute", r: 3, a: a0 * 0.8 });
+        if (i === 0) g.text("time to read the weights once", x0 + bw * frac * 0.5 + 10, y + 61, { size: 12, color: "compute", a: a0 });
+      });
+    }
+    if (a1 > 0.01) {
+      // a 128×128 weight tile split into 32×32 blocks
+      const n = 4, size = Math.min(H - 220, narrow ? W - 100 : W * 0.42), cs = size / n, x0 = 50, y0 = 80;
+      const R = rng(5);
+      for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+        const e = -2 - Math.floor(R() * 5), hot = i === 1 && j === 2;
+        g.rect(x0 + j * cs + 2, y0 + i * cs + 2, cs - 4, cs - 4, { fill: "memory", r: 4, a: a1 * (hot ? 0.75 : 0.12 + 0.08 * ((i + j) % 2)) });
+        g.text("2^" + e, x0 + j * cs + cs / 2, y0 + i * cs + cs / 2 + 5, { size: 13, color: hot ? "sheet" : "memory", align: "center", weight: 600, a: a1 });
+      }
+      g.dim(x0, x0 + cs, y0 - 18, "32", { a: a1, size: 12 });
+      g.text("one 128 × 128 slice of a weight matrix", x0, y0 + size + 30, { size: 13, color: "ink-3", a: a1 });
+      // bit layouts
+      const bx = narrow ? 50 : x0 + size + 70, by = narrow ? y0 + size + 70 : y0 + 10, cw = narrow ? 34 : 38;
+      const lay = (y, title, bits, note) => {
+        g.text(title, bx, y, { size: 16, font: "display", weight: 800, color: "ink", a: a1 });
+        bits.forEach(([ch, c], k) => {
+          g.rect(bx + k * (cw + 3), y + 12, cw, cw, { fill: c, r: 4, a: a1 * 0.8 });
+          g.text(ch, bx + k * (cw + 3) + cw / 2, y + 12 + cw * 0.66, { size: 14, color: "sheet", align: "center", weight: 700, a: a1 });
+        });
+        g.text(note, bx, y + cw + 34, { size: 12, color: "ink-2", a: a1 });
+      };
+      const E = (n_) => Array.from({ length: n_ }, () => ["e", "compute"]);
+      lay(by, "ue8m0 · weight block scale", E(8), "8 exponent bits, no sign, no mantissa → exact power of two");
+      lay(by + cw + 80, "e4m3 · FP8 value / KV scale", [["s", "ink-3"], ...E(4), ["m", "cpu"], ["m", "cpu"], ["m", "cpu"]], "sign, 4 exponent, 3 mantissa → max 448");
+    }
+    if (a2 > 0.01) {
+      const x0 = 60, x1 = W - 60, y = 120, sx = (v) => x0 + (x1 - x0) * v / 6;
+      g.line(x0, y, x1, y, { color: "ink-3", lw: 1.5, a: a2 });
+      for (let v = 0; v <= 6; v += 0.25) g.line(sx(v), y - 4, sx(v), y + 4, { color: "hair", lw: 1, a: a2 });
+      FP4.forEach((l, i) => {
+        const p = ramp(s.t % 5, 0.3 + i * 0.12, 0.3);
+        g.circle(sx(l), y, 9, { fill: "compute", stroke: "sheet", lw: 2, a: a2 * p });
+        g.text(String(l), sx(l), y + 34, { size: 15, color: "compute", align: "center", weight: 700, a: a2 * p });
+      });
+      g.text("E2M1: every non-negative value FP4 can hold", x0, y - 30, { size: 14, color: "ink", weight: 600, a: a2 });
+      g.text("(plus a sign bit)", x0 + g.tw("E2M1: every non-negative value FP4 can hold", 14, "mono", 600) + 10, y - 30, { size: 13, color: "ink-3", a: a2 });
+      // block strips
+      const strip = (yy, n, label, scaleLab, scaleCol, note) => {
+        const cw = Math.min(22, (W - 160) / 34);
+        g.text(label, x0, yy - 14, { size: 16, font: "display", weight: 800, color: "ink", a: a2 });
+        let x = x0;
+        for (let rep = 0; rep < 32 / n; rep++) {
+          for (let k = 0; k < n; k++) { g.rect(x, yy, cw - 2, 26, { fill: "compute", r: 3, a: a2 * 0.5 }); x += cw; }
+          g.rect(x + 2, yy - 4, cw * 1.6, 34, { fill: scaleCol, r: 4, a: a2 * 0.9 });
+          g.text(scaleLab, x + 2 + cw * 0.8, yy + 18, { size: 11, color: "sheet", align: "center", weight: 700, a: a2 });
+          x += cw * 1.6 + 8;
+        }
+        g.text(note, x0, yy + 52, { size: 13, color: "ink-2", a: a2 });
+      };
+      strip(y + 120, 32, "MXFP4 · experts, indexer keys", "E8", "memory", "32 × 4-bit values share one power-of-two scale");
+      strip(y + 240, 16, "FP4 main KV", "e4m3", "cpu", "16 × 4-bit values per FP8 scale: like NVFP4, minus the per-tensor scale");
+    }
+    if (a3 > 0.01) {
+      const rows = [
+        ["BF16", 16, 0, "reference"],
+        ["FP8 · 32×32", 8, 8 / 1024, "dense weights"],
+        ["MXFP4", 4, 8 / 32, "experts · indexer KV"],
+        ["FP4 · e4m3/16", 4, 8 / 16, "main KV cache"],
+      ];
+      const x0 = narrow ? 40 : 200, x1 = W - 40, sx = (v) => x0 + (x1 - x0) * v / 16;
+      rows.forEach(([lab, eb, sb, use], i) => {
+        const y = 90 + i * 100, grow = ease(clamp((s.t % 6 - i * 0.2) / 0.7));
+        if (narrow) { g.text(lab, x0, y - 10, { size: 16, font: "display", weight: 800, color: "ink", a: a3 }); }
+        else g.text(lab, x0 - 16, y + 26, { size: 18, font: "display", weight: 800, color: "ink", align: "right", a: a3 });
+        g.rect(x0, y, (sx(eb) - x0) * grow, 38, { fill: "compute", r: 4, a: a3 * 0.85 });
+        if (sb > 0) g.rect(sx(eb), y, Math.max(3, (sx(eb + sb) - sx(eb)) * grow), 38, { fill: "memory", r: 2, a: a3 * 0.9 });
+        const tot = eb + sb;
+        g.text((tot % 1 === 0 ? tot.toFixed(0) : tot.toFixed(tot < 8.1 && tot > 8 ? 3 : 2)) + " bits", sx(tot) + 12, y + 25, { size: 15, color: "ink", weight: 700, a: a3 * grow });
+        g.text(use, x0, y + 58, { size: 12, color: "ink-3", a: a3 });
+      });
+      g.chip(x0, 50, "element bits", "compute", { size: 12, a: a3 });
+      g.chip(x0 + 140, 50, "scale bits, amortized", "memory", { size: 12, a: a3 });
+    }
+  }, { anim: true, restT: 2.5 });
+
+  /* ---------------- quantization lab ---------------- */
+  const QN = 128;
+  const QX = (() => { const R = rng(21); const a = []; for (let i = 0; i < QN; i++) a.push(gauss(R)); return a; })();
+  Atlas.scene("quant", (g, s) => {
+    const st = s.state; if (st.qblock === undefined) return;
+    const block = Math.pow(2, st.qblock), elem = st.qfmt || "fp4", scaleFmt = st.qscale || "ue8m0";
+    const OI = 45;
+    const xs = QX.slice(); if (st.qout > 1) xs[OI] = st.qout;
+    const { out, scales } = quantize(xs, block, elem, scaleFmt);
+    let num = 0, den = 0, zeroed = 0;
+    xs.forEach((v, i) => { num += (v - out[i]) ** 2; den += v * v; if (out[i] === 0 && Math.abs(v) > 0.05) zeroed++; });
+    document.getElementById("q-err").textContent = (100 * Math.sqrt(num / den)).toFixed(1) + "%";
+    const bits = (elem === "fp4" ? 4 : 8) + 8 / block;
+    document.getElementById("q-bits").textContent = bits.toFixed(bits % 1 ? 3 : 0).replace(/0+$/, "").replace(/\.$/, "");
+    const { W, H } = g;
+    const x0 = 50, x1 = W - 20, mid = H * 0.46, clip = 3.2, hs = (H * 0.34) / clip;
+    const bw = (x1 - x0) / QN;
+    // block backgrounds
+    for (let b = 0; b < QN / block; b++) {
+      const bx = x0 + b * block * bw, inOut = OI >= b * block && OI < (b + 1) * block;
+      if (inOut && st.qout > 3) g.rect(bx, mid - clip * hs - 10, block * bw, 2 * clip * hs + 20, { fill: "bad", r: 4, a: 0.08 });
+      g.line(bx, mid - clip * hs - 14, bx, mid + clip * hs + 14, { color: "hair", lw: 1 });
+      if (block >= 16) {
+        const e = Math.log2(scales[b]);
+        const lab = scaleFmt === "ue8m0" ? "2^" + Math.round(e) : scales[b].toPrecision(2);
+        g.text(lab, bx + block * bw / 2, mid - clip * hs - 22, { size: 11, color: inOut && st.qout > 3 ? "bad" : "memory", align: "center", weight: 600 });
+      }
+    }
+    g.line(x1, mid - clip * hs - 14, x1, mid + clip * hs + 14, { color: "hair", lw: 1 });
+    g.line(x0, mid, x1, mid, { color: "ink-3", lw: 1 });
+    xs.forEach((v, i) => {
+      const x = x0 + i * bw + bw * 0.12, w = Math.max(1.5, bw * 0.76);
+      const cv = clamp(v, -clip, clip), cq = clamp(out[i], -clip, clip);
+      const dead = out[i] === 0 && Math.abs(v) > 0.05;
+      g.rect(x, Math.min(mid, mid - cv * hs), w, Math.abs(cv * hs), { fill: dead ? "bad" : "ink-3", r: 1, a: dead ? 0.55 : 0.25 });
+      g.rect(x, Math.min(mid, mid - cq * hs), w, Math.max(1, Math.abs(cq * hs)), { fill: i === OI && st.qout > 1 ? "memory" : "compute", r: 1, a: 0.85 });
+    });
+    if (st.qout > clip) {
+      const x = x0 + OI * bw + bw / 2;
+      g.head(x, mid - clip * hs - 2, -Math.PI / 2, { color: "memory", size: 9 });
+      g.text("outlier " + st.qout + "×", x + 8, mid - clip * hs + 14, { size: 12, color: "memory", weight: 600 });
+    }
+    const ly = mid + clip * hs + 46;
+    g.rect(x0, ly - 10, 12, 12, { fill: "ink-3", r: 2, a: 0.3 }); g.text("original", x0 + 18, ly, { size: 12, color: "ink-2" });
+    g.rect(x0 + 110, ly - 10, 12, 12, { fill: "compute", r: 2 }); g.text("quantized", x0 + 128, ly, { size: 12, color: "ink-2" });
+    g.rect(x0 + 230, ly - 10, 12, 12, { fill: "bad", r: 2, a: 0.55 }); g.text(`rounded to zero: ${zeroed}`, x0 + 248, ly, { size: 12, color: zeroed ? "bad" : "ink-2", weight: zeroed ? 600 : 500 });
+    g.text(`${QN / block} block${QN / block > 1 ? "s" : ""} of ${block}`, x1, ly, { size: 12, color: "ink-3", align: "right" });
+  }, { controls: "q-ctl", format: (id, v) => (id === "qblock" ? String(Math.pow(2, v)) : String(v)) });
+
+  /* ---------------- kernel shelf ---------------- */
+  Atlas.scene("shelf", (g, s) => {
+    const { W, H, narrow } = g;
+    const a0 = s.solo(0), a1 = s.solo(1), a2 = s.solo(2), a3 = s.solo(3);
+    if (a0 > 0.01) {
+      const libs = [
+        ["FlashMLA", "attention", "sparse · compressed", "compute"],
+        ["DeepGEMM", "matmuls", "dense · grouped · mega MoE", "compute"],
+        ["DeepEP", "all-to-all", "dispatch · combine · Engram", "net"],
+        ["DeepSelect", "top-k", "indexer · sampler", "cpu"],
+        ["TileKernels", "SwiGLU + quant", "MoE gate on Ascend", "cpu"],
+        ["TileLang ops", "engine glue", "~29 per backend", "memory"],
+      ];
+      const cols = narrow ? 2 : 3, gap = 16, bw = (W - 80 - gap * (cols - 1)) / cols, bh = narrow ? 92 : 104;
+      g.box(40, 50, W - 80, 54, { color: "ink-3", title: "DeepInfer engine · model code", tsize: 20, a: a0, wash: 0.06 });
+      const top = 150;
+      libs.forEach(([name, what, sub, c], i) => {
+        const r = Math.floor(i / cols), k = i % cols, x = 40 + k * (bw + gap), y = top + r * (bh + gap);
+        const p = ramp(s.t % 6, 0.2 + i * 0.12, 0.35);
+        g.box(x, y, bw, bh, { color: c, a: a0 * p });
+        g.text(name, x + 14, y + 30, { size: 20, font: "display", weight: 800, color: "ink", a: a0 * p });
+        g.text(what, x + 14, y + 54, { size: 14, color: c, weight: 600, a: a0 * p });
+        g.text(sub, x + 14, y + 76, { size: 12, color: "ink-2", a: a0 * p });
+        g.line(x + bw / 2, 104, x + bw / 2, y, { color: c, lw: 1, dash: [2, 4], a: a0 * p * 0.35 });
+      });
+      const rows = Math.ceil(libs.length / cols), by = top + rows * (bh + gap) + 10;
+      g.rect(40, by, W - 80, 40, { fill: "ink", r: 6, a: a0 * 0.85 });
+      g.text("SM100 GPU  ·  Ascend 950 NPU", W / 2, by + 26, { size: 15, color: "sheet", align: "center", weight: 600, a: a0 });
+    }
+    if (a1 > 0.01) {
+      const steps = ["gate", "dispatch", "GEMM 1", "SwiGLU", "GEMM 2", "combine"];
+      const x0 = 40, x1 = W - 40, n = steps.length, sw = (x1 - x0) / n;
+      const fuse = ease(clamp(((s.t % 7) - 2.2) / 1.2));
+      const y = Math.max(110, H * 0.17), hbm = y + Math.max(140, H * 0.24);
+      g.text("unfused: gate, then five steps with intermediates through memory", x0, 70, { size: 14, color: "ink-2", a: a1 * (1 - fuse) });
+      g.text("mega MoE: gate, then one launch inside the NVLink domain", x0, 70, { size: 14, color: "ok", weight: 600, a: a1 * fuse });
+      steps.forEach((st, i) => {
+        const xs = x0 + i * sw + 6, w = sw - 12;
+        const fw = (x1 - x0 - sw) / (n - 1);
+        const xf = i === 0 ? xs : lerp(xs, x0 + sw + (i - 1) * fw, fuse), wf = i === 0 ? w : lerp(w, fw + 0.5, fuse);
+        g.rect(xf, y, wf, 64, { fill: i === 1 || i === 5 ? "net" : i === 0 ? "cpu" : "compute", r: i === 0 ? 8 : lerp(8, i === 1 || i === n - 1 ? 8 : 0, fuse), a: a1 * 0.8 });
+        g.text(st, xf + wf / 2, y + 38, { size: narrow ? 12 : 14, color: "sheet", align: "center", weight: 700, a: a1 });
+        if (i > 0 && i < n - 1) {
+          const ax = xs + w + 6;
+          g.curve([ax - 6, y + 66], [ax, 2 * (hbm + 2) - (y + 66)], [ax + 6, y + 66], { color: "memory", lw: 1.5, head: 7, a: a1 * (1 - fuse) });
+        }
+      });
+      g.rect(x0, hbm - 8, x1 - x0, 22, { fill: "memory", r: 4, a: a1 * 0.25 * (1 - fuse) });
+      g.text("HBM round-trips", x0 + 8, hbm + 8, { size: 12, color: "memory", weight: 600, a: a1 * (1 - fuse) });
+      g.rect(x0 + sw - 4, y - 8, x1 - x0 - sw + 10, 80, { stroke: "ok", lw: 2.5, r: 12, a: a1 * fuse });
+      g.text("gate: its own fused call", x0, y + 84, { size: 11, color: "cpu", a: a1 * fuse });
+      ["tokens exchanged through symmetric memory (NVLink)", "shared expert can be folded in", "expert loads counted for EPLB on the way"].forEach((t, i) =>
+        g.text("✓ " + t, x0, y + 120 + i * 24, { size: 13, color: "ok", a: a1 * ramp(fuse, 0.4 + i * 0.15, 0.3) }));
+      // timeline
+      const ty = Math.max(hbm + 80, H - 150), tl = (x1 - x0);
+      g.text("one MoE layer, illustrative timeline", x0, ty - 18, { size: 12, color: "ink-3", a: a1 });
+      let x = x0; const segs = [0.06, 0.16, 0.22, 0.05, 0.16, 0.12];
+      segs.forEach((w, i) => { g.rect(x, ty, w * tl * 0.95 - 4, 22, { fill: i === 1 || i === 5 ? "net" : i === 0 ? "cpu" : "compute", r: 3, a: a1 * 0.7 }); x += w * tl * 0.95 + 6; });
+      g.text("unfused", x + 8, ty + 16, { size: 12, color: "ink-2", a: a1 });
+      g.rect(x0, ty + 36, tl * 0.06 * 0.95 - 4, 22, { fill: "cpu", r: 3, a: a1 * 0.7 * fuse });
+      g.rect(x0 + tl * 0.057 + 2, ty + 36, tl * 0.52 * fuse, 22, { fill: "ok", r: 3, a: a1 * 0.8 });
+      g.text("gate + mega MoE", x0 + tl * 0.057 + tl * 0.52 * fuse + 10, ty + 52, { size: 12, color: "ok", weight: 600, a: a1 * fuse });
+      g.text("bar lengths are a sketch, not measurements", x0, ty + 84, { size: 11, color: "ink-3", a: a1 });
+    }
+    if (a2 > 0.01) {
+      const ops = ["candidate_blocks", "compress", "compute_seqlens_k_zos", "dflash", "dflash_copy", "flash_mla_utils", "fused_sample", "fused_transform", "gather", "gather_engram_tokens_zos", "gather_input_ids_zos", "get_kv_index", "image_embed_ops", "kv_index_cat", "load_paged_kv_cache", "norm", "outlier_detection", "prepare_cp_mirror", "prepare_decode_metadata", "random_sampling", "sampler", "schedule_mtp_varlen", "state_cache", "store_kv_cache", "store_mtp_info", "structure_output", "sum_smaller_probs", "swa_index"];
+      const cx = W / 2, y0 = 70;
+      g.pill(cx, y0, "ops.store_kv_cache(kv, cache, slots)", { size: narrow ? 13 : 15, align: "center", color: "ink", a: a2 });
+      g.text("PLATFORM.tilelang_ops_backend", cx, y0 + 46, { size: 12, color: "ink-3", align: "center", a: a2 });
+      const lx = W * 0.27, rx = W * 0.73, by = y0 + 110;
+      const p = ramp(s.t % 5, 0.4, 0.5);
+      g.curve([cx, y0 + 54], [lx, y0 + 60], [lx, by - 20], { color: "compute", lw: 2, head: 9, a: a2, prog: p });
+      g.curve([cx, y0 + 54], [rx, y0 + 60], [rx, by - 20], { color: "net", lw: 2, head: 9, a: a2, prog: p });
+      g.pill(lx, by, "cuda/store_kv_cache.py", { size: narrow ? 12 : 14, align: "center", color: "compute", stroke: "compute", a: a2 });
+      g.pill(rx, by, "asc/store_kv_cache.py", { size: narrow ? 12 : 14, align: "center", color: "net", stroke: "net", a: a2 });
+      g.text("NVIDIA", lx, by + 36, { size: 12, color: "ink-3", align: "center", a: a2 });
+      g.text("Ascend", rx, by + 36, { size: 12, color: "ink-3", align: "center", a: a2 });
+      // op cloud
+      let x = 40, y = by + 80; const fs = narrow ? 11 : 12;
+      ops.forEach((o, i) => {
+        const w = g.tw(o, fs, "mono", 500) + 16;
+        if (x + w > W - 40) { x = 40; y += 30; }
+        const hot = o === "store_kv_cache";
+        g.rect(x, y - 11, w, 22, { fill: hot ? "compute" : "sheet", stroke: hot ? "compute" : "hair", lw: 1, r: 11, a: a2 * ramp(s.t % 5, 0.9 + i * 0.03, 0.3) });
+        g.text(o, x + w / 2, y + 4, { size: fs, color: hot ? "sheet" : "ink-2", align: "center", a: a2 * ramp(s.t % 5, 0.9 + i * 0.03, 0.3) });
+        x += w + 6;
+      });
+      g.text("most ops exist in both backend folders; a few are backend-only", 40, y + 40, { size: 13, color: "ink-2", a: a2 });
+    }
+    if (a3 > 0.01) {
+      const colW = (W - 100) / 2, cy = 60;
+      const stacks = [
+        ["NVIDIA SM100", "CUDA 13", "compute", ["FlashMLA", "DeepGEMM", "DeepEP", "DeepSelect", "TileLang cuda/", "FlashAttention-4 · vision"]],
+        ["Ascend 950", "CANN 9.2", "net", ["FlashMLA (ASCEND target)", "DeepGEMM-Ascend", "DeepEP-Ascend", "DeepSelect (ASCEND target)", "TileLang asc/", "torch-npu"]],
+      ];
+      stacks.forEach(([name, sdk, c, libs], k) => {
+        const x = 40 + k * (colW + 20);
+        g.text(name, x, cy + 10, { size: 22, font: "display", weight: 800, color: c, a: a3 });
+        g.text(sdk, x, cy + 32, { size: 12, color: "ink-3", a: a3 });
+        libs.forEach((l, i) => {
+          const y = cy + 50 + i * 34;
+          g.rect(x, y, colW, 28, { fill: c, r: 5, a: a3 * (0.1 + 0.06 * (i % 2)) });
+          g.text(l, x + 10, y + 19, { size: narrow ? 11 : 13, color: "ink", a: a3 });
+        });
+      });
+      g.text("DEEPINFER_ACCELERATOR=nvidia | ascend", 40, cy + 50 + 6 * 34 + 20, { size: 13, color: "ink-2", weight: 600, a: a3 });
+      // NUMA
+      const ny = cy + 50 + 6 * 34 + 54, nh = Math.min(130, H - ny - 30);
+      if (nh > 90) {
+        const nw = (W - 100) / 2;
+        [0, 1].forEach((k) => {
+          const x = 40 + k * (nw + 20), hot = k === 0;
+          g.box(x, ny, nw, nh, { color: hot ? "ok" : "ink-3", wash: hot ? 0.08 : 0.03, a: a3, dash: hot ? null : [4, 4] });
+          g.text("NUMA node " + k, x + 12, ny + 22, { size: 12, color: hot ? "ok" : "ink-3", weight: 600, a: a3 });
+          const cw_ = (nw - 48) / 4;
+          ["CPU", "DRAM", "GPU", "NIC"].forEach((d, j) => {
+            const dx = x + 12 + j * (cw_ + 8);
+            g.rect(dx, ny + 34, cw_, Math.max(26, nh - 50), { fill: j < 2 ? "cpu" : j === 2 ? "compute" : "net", r: 4, a: a3 * (hot ? 0.75 : 0.25) });
+            g.text(d, dx + cw_ / 2, ny + 34 + Math.max(26, nh - 50) / 2 + 5, { size: 11, color: "sheet", align: "center", weight: 700, a: a3 });
+          });
+        });
+        g.text("bind_numa: threads and memory pinned to the node that owns the process's GPU", 40, ny + nh + 24, { size: 12, color: "ok", weight: 600, a: a3 });
+      }
+    }
+  }, { anim: true, restT: 3.5 });
+})();
+
+</script>
+<script>AtlasAlts.render("alts-kernels", "sources-kernels", "kernels");</script>
+</body>
+</html>

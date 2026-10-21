@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Bounded replay · DeepInfer Annotated</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&display=swap">
+<link rel="stylesheet" href="atlas.css">
+</head>
+<body>
+<header class="bar">
+  <div class="wrap">
+    <a class="brand" href="index.html"><b>DeepInfer</b><span>annotated</span></a>
+    <nav aria-label="Chapters">
+      <a class="num" href="loop.html" title="The generation loop">01</a>
+      <a class="num" href="model.html" title="The model it serves">02</a>
+      <a class="num" href="engine.html" title="Anatomy of the engine">03</a>
+      <a class="num" href="memory.html" title="KV memory">04</a>
+      <a class="num" href="scheduling.html" title="Scheduling a step">05</a>
+      <a class="num" href="parallelism.html" title="One model, many GPUs">06</a>
+      <a class="num" href="cluster.html" title="The cluster around it">07</a>
+      <a class="num" href="replay.html" aria-current="page" title="Bounded replay">08</a>
+      <a class="num" href="speculation.html" title="Speculative decoding">09</a>
+      <a class="num" href="kernels.html" title="Numbers and kernels">10</a>
+      <a class="num" href="sampling.html" title="Sampling, structure, determinism">11</a>
+      <a class="num" href="frontdoor.html" title="The front door">12</a>
+      <a class="num" href="measure.html" title="Measuring it">13</a>
+      <a href="index.html">Map</a>
+    </nav>
+  </div>
+  <div class="progress"></div>
+</header>
+<main>
+  <section class="hero">
+    <div class="wrap">
+      <div>
+        <span class="eyebrow"><span class="n">08</span> Recomputation</span>
+        <h1>Replay only <em>what you must</em></h1>
+        <p class="dek">When part of a cached prefix is missing, the exact repair can mean thousands of tokens through dozens of layers. DeepInfer replays 128 tokens, accepts a tiny approximation, and nearly halves the cost of prefill.</p>
+        <div class="files">
+          <span class="tag">v4_modules/yoco.py</span>
+          <span class="tag">input_metadata/yoco.py</span>
+          <span class="tag">tilelang_ops/swa_index.py</span>
+          <span class="tag">examples/yoco/yoco_equiv.py</span>
+        </div>
+      </div>
+      <div class="board stage-card" data-stage="band" data-label="A sliding-window attention mask drawn as a band along the diagonal; a replay segment begins partway down, and its rows are clipped so they only see keys inside the segment.">
+        <span class="ruler">sliding-window mask · replay from s</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="problem">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">The problem</span>
+        <h2>Two caches, two lifetimes</h2>
+        <p class="lede">Chapter 07's storage keeps long-range block KV for days. The sliding-window state is treated differently, and sometimes it's gone.</p>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">Lifetimes</span><h4>Block KV in storage, window in host memory</h4><p>Block KV goes to the shared 3FS cluster. The window state is saved only at multiples of 128 tokens, only for the first 20 layers, only in the host memory of the machine that produced it, and nothing is saved partway through a chunked prefill.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">The gap</span><h4>A hit can arrive without its window</h4><p>A new request may match a long prefix in storage while the window state for the end of that prefix was evicted, never stored, or sits on a machine that's gone. Long-range attention is fine; the last 128 positions' window is missing.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Exact repair</span><h4>The receptive field grows with depth</h4><p>To rebuild layer <i>l</i>'s window exactly you need layer <i>l</i>'s inputs for those positions, which depend on the window of layer <i>l</i>−1 for 128 positions before them, and so on down. Across 20 layers that's 20 × 128 = 2,560 tokens of replay.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="cone" data-label="Layers stacked vertically over a token axis: block KV stored in storage; the window state saved at 128-token marks; then a receptive-field cone that widens by 128 tokens per layer going down, reaching 2,560 tokens at 20 layers."><span class="ruler">layers × tokens</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="bounded">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Bounded replay</span>
+        <h2>Replay 128 tokens and clip the window</h2>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">The trick</span><h4>Start the replay at s, see nothing before s</h4><p>DeepInfer recomputes only the last 128 tokens of the hit prefix, alongside the uncached suffix, and truncates the window to the replayed segment: the query at position <i>i</i> sees keys from max(<i>s</i>, <i>i</i>−127) to <i>i</i>. Positions near <i>s</i> see a shorter window than they did originally.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">What's reused</span><h4>Block KV untouched; only the window rebuilt</h4><p>The replayed segment rebuilds the sliding-window KV. Its long-range block KV comes from storage as-is, neither recomputed nor overwritten. The cost is now a constant: 128 tokens, whatever the context length or layer count.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Proof it's the same code path</span><h4>Mask mode vs compact mode</h4><p>Truncation can be done by masking rows (simple) or by physically dropping them (fast). <code>examples/yoco/yoco_equiv.py</code> checks they agree: level 1 compares window pivots, visible keys and store slots on one device in seconds; level 2 runs both on 8 GPUs and compares log-probabilities and top-K element by element.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="clip" data-label="Attention mask matrix: the full sliding window band, the replay start s, clipped cells before s outlined in red, and a cost chart where exact repair grows with layers while bounded replay stays flat."><span class="ruler">mask · replay segment</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="decoder">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Decoder bounded replay</span>
+        <h2>Half the model skips most of prefill</h2>
+        <p class="lede">The same idea applied inside every request, not just on cache hits. It's the single biggest prefill saving in the system.</p>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">Recall</span><h4>Consumer layers don't read the prompt</h4><p>V4.1's later layers take their long-range KV from the hidden state of the last early layer (chapter 02). So prefill only needs the early layers to run over the whole prompt; the consumer layers' long-range KV falls out of that.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">But</span><h4>Decode still needs their windows</h4><p>Every consumer layer still attends to its own last-128-token window during decode. Rebuilding those exactly would mean running 2,560 tokens through 20 layers. Instead, prefill runs the consumer layers on just the last 140 tokens: the 128-token window plus slack for speculative backtracking.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Effect</span><h4>Nearly half of prefill, gone</h4><p>The replayed windows are used only for decode and never enter the prefix cache. Total prefill compute drops by nearly half. The repo's prefill benchmark is measured with it on: <code>DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE=compact</code>, <code>KEEP_TOKENS=140</code>.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="yoco" data-label="Prefill work drawn as layer rows over prompt tokens: early layers span the full prompt; consumer layers span only the last 140 tokens, with their full-width ghost outlines showing the work skipped."><span class="ruler">prefill work · layers × tokens</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="lab">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Try it</span>
+        <h2>What the replayed rows can see</h2>
+        <p class="lede">A miniature: 24 positions, a window of 6. Move the replay start and compare the exact window to the clipped one.</p>
+      </header>
+      <div class="lab">
+        <div class="controls" id="mask-ctl">
+          <div class="ctl"><label for="ms">Replay starts at s <output for="ms">12</output></label><input type="range" id="ms" min="0" max="20" step="1" value="12"></div>
+          <div class="ctl"><label for="mw">Window w <output for="mw">6</output></label><input type="range" id="mw" min="2" max="10" step="1" value="6"></div>
+          <div class="readout">
+            <div><b id="m-lost">–</b><span>keys clipped</span></div>
+            <div><b id="m-rows">–</b><span>rows affected</span></div>
+          </div>
+          <p class="note">Only the first w−1 replayed rows lose keys; every row from s + w − 1 on sees its full window. With w = 128 that's the first 127 replayed positions, each losing a shrinking tail of history.</p>
+        </div>
+        <div class="board" data-stage="mask" data-label="Attention mask grid: green cells visible after clipping, red-outlined cells clipped, blue cells outside the replay that are reused from cache."><span class="ruler">query rows × key columns</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="code">
+    <div class="wrap stack">
+      <header>
+        <span class="eyebrow">In the repo</span>
+        <h2>The predicates</h2>
+      </header>
+      <div class="split">
+        <div class="code">
+          <div class="hd"><span>models/v4_modules/yoco.py</span><a href="https://github.com/deepseek-ai/DeepInfer/blob/main/deepinfer/model_executor/models/v4_modules/yoco.py" target="_blank" rel="noopener">source</a></div>
+<pre><span class="k">def</span> yoco_enabled(cfg) -&gt; bool:
+    <span class="c">"""Whether the model enables YOCO</span>
+<span class="c">    (layers after n_prefill_layer are consumer layers)."""</span>
+    <span class="k">return</span> cfg.get(<span class="s">"n_prefill_layer"</span>, cfg.num_hidden_layers) &lt; cfg.num_hidden_layers
+
+<span class="k">def</span> is_yoco_consumer_layer(cfg, layer_idx) -&gt; bool:
+    <span class="c">"""YOCO consumer layer: [n_prefill_layer, n_layer)."""</span>
+    <span class="k">return</span> yoco_enabled(cfg) <span class="k">and</span> cfg.n_prefill_layer &lt;= layer_idx &lt; cfg.num_hidden_layers
+
+<span class="k">def</span> yoco_boundary_compact(input_metadata, x):
+    <span class="c">"""Keep only the per-token rows that survive truncation;</span>
+<span class="c">    with CP on, first select the held tokens that remain."""</span></pre>
+        </div>
+        <div class="prose">
+          <p><b>Settings that must agree.</b> The retained suffix has to cover the window plus the maximum backtracking length, so the defaults are 128 + 6 = 134 for hit capping and 140 kept tokens in decoder replay.</p>
+          <p><b>A known cost of preemption.</b> With truncation on, a preempted and recomputed request may produce slightly different results; the engine's step loop says so in a comment.</p>
+          <p><b>Why not store everything?</b> The window state for all 40 layers at every 128-token mark would multiply host memory and transfer volume. Storing 20 layers at 128-token marks costs 1.42 MB per sequence, and the rest is cheaper to replay.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="others">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Other ways to do it</span>
+        <h2>Keep it, recompute it, or skip it</h2>
+      </header>
+      <div class="compare" id="alts-replay"></div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap"><div class="sources" id="sources-replay"></div></div>
+  </section>
+
+</main>
+<nav class="next" aria-label="Chapter navigation">
+  <div class="wrap">
+    <a href="cluster.html"><span>← Chapter 07</span><b>The cluster around it</b></a>
+    <a class="fwd" href="speculation.html"><span>Chapter 09 →</span><b>Speculative decoding</b></a>
+  </div>
+</nav>
+<script src="atlas.js"></script>
+<script src="alts.js"></script>
+<script>
+(function () {
+  const { ramp, ease, clamp, lerp } = Atlas;
+
+  function drawMask(g, x0, y0, size, n, w, s, a = 1, opts = {}) {
+    const cs = size / n;
+    let lost = 0, rows = 0;
+    for (let i = 0; i < n; i++) {
+      let rowLost = 0;
+      for (let j = 0; j <= i; j++) {
+        const inWin = j >= i - w + 1;
+        let fill = "grid", stroke = null, fa = 1;
+        if (i < s) { if (inWin) { fill = "compute"; fa = 0.45; } }
+        else if (inWin) {
+          if (j >= s) { fill = "ok"; fa = 0.9; } else { fill = "sheet"; stroke = "bad"; rowLost++; }
+        }
+        if (opts.exact && i >= s && inWin) { fill = "ok"; stroke = null; fa = 0.9; }
+        g.rect(x0 + j * cs + 1, y0 + i * cs + 1, cs - 2, cs - 2, { fill, stroke, lw: 1.5, r: Math.min(3, cs / 5), a: a * fa });
+      }
+      if (rowLost) { lost += rowLost; rows++; }
+    }
+    if (s > 0 && s < n) {
+      g.line(x0 - 6, y0 + s * cs, x0 + size + 6, y0 + s * cs, { color: "ok", lw: 2, a });
+      if (opts.label !== false) g.text("s", x0 + size + 12, y0 + s * cs + 5, { size: 14, color: "ok", weight: 700, a });
+    }
+    return { lost, rows };
+  }
+
+  /* ---------------- hero ---------------- */
+  Atlas.scene("band", (g, s) => {
+    const { W, H } = g;
+    const n = 28, w = 7, size = Math.min(W - 160, H - 80);
+    const sv = 6 + Math.floor(((Math.sin(s.t * 0.6) + 1) / 2) * 16);
+    drawMask(g, (W - size) / 2 - 40, 40, size, n, w, sv);
+    const lx = (W + size) / 2 - 10;
+    g.rect(lx, 60, 14, 14, { fill: "compute", r: 3, a: 0.45 }); g.text("from cache", lx + 22, 72, { size: 13, color: "ink-2" });
+    g.rect(lx, 90, 14, 14, { fill: "ok", r: 3 }); g.text("replayed", lx + 22, 102, { size: 13, color: "ink-2" });
+    g.rect(lx, 120, 14, 14, { stroke: "bad", lw: 1.5, r: 3 }); g.text("clipped", lx + 22, 132, { size: 13, color: "ink-2" });
+  }, { anim: true, restT: 2.2, zoom: 1.0, minW: 520 });
+
+  /* ---------------- the problem: cone ---------------- */
+  Atlas.scene("cone", (g, s) => {
+    const { W, H } = g;
+    const x0 = 70, x1 = W - 40, top = 70, bot = H - 80, L = 20;
+    const T = 3200, sx = (t) => x0 + (x1 - x0) * t / T, ly = (l) => bot - (bot - top) * (l + 1) / L;
+    const rh = (bot - top) / L;
+    for (let l = 0; l < L; l++) g.rect(x0, ly(l) + 1, x1 - x0, rh - 2, { fill: "grid", r: 1 });
+    g.text("layer 0", x0 - 8, ly(0) + rh * 0.7, { size: 11, color: "ink-3", align: "right" });
+    g.text("19", x0 - 8, ly(19) + rh * 0.7, { size: 11, color: "ink-3", align: "right" });
+    g.text("tokens →", x1, bot + 24, { size: 12, color: "ink-3", align: "right" });
+    // b0: block KV + window marks
+    const a0 = 1 - s.at(2) * 0.6;
+    g.rect(x0, bot + 8, x1 - x0, 8, { fill: "ok", r: 2, a: a0 * 0.8 });
+    g.text("block KV · in 3FS", x0, bot + 34, { size: 12, color: "ok", a: a0 });
+    for (let t = 128; t < T; t += 128) g.line(sx(t), top - 6, sx(t), top - 16, { color: "memory", lw: 1.2, a: a0 });
+    g.text("window state saved only at 128-token marks · first 20 layers · host memory", x0, top - 24, { size: 12, color: "memory", a: a0 });
+    // b1: missing window at the end
+    const a1 = s.at(1);
+    if (a1 > 0.01) {
+      for (let l = 0; l < L; l++) g.rect(sx(T - 128), ly(l) + 1, sx(T) - sx(T - 128), rh - 2, { stroke: "bad", lw: 1.2, dash: [3, 3], r: 1, a: a1 });
+      g.text("?", sx(T - 64), ly(10) + 6, { size: 22, color: "bad", align: "center", weight: 700, a: a1 * (1 - s.at(2)) });
+    }
+    // b2: cone
+    const a2 = s.at(2);
+    if (a2 > 0.01) {
+      const grow = clamp((s.t % 5) / 3.5);
+      for (let l = L - 1; l >= 0; l--) {
+        const depth = L - l; // 1..20
+        const prog = clamp(grow * L - (L - 1 - l));
+        if (prog <= 0) continue;
+        const need = 128 * depth;
+        g.rect(sx(T - need), ly(l) + 1, sx(T) - sx(T - need), rh - 2, { fill: "bad", r: 1, a: a2 * 0.18 + 0.5 * a2 * (l === L - 1 ? 1 : 0.6) * prog });
+      }
+      g.dim(sx(T - 2560), sx(T), bot + 54, "2,560 tokens to rebuild exactly", { color: "bad", a: a2 });
+    }
+  }, { anim: true, restT: 4 });
+
+  /* ---------------- bounded replay ---------------- */
+  Atlas.scene("clip", (g, s) => {
+    const { W, H, narrow } = g;
+    const a0 = s.swapOut(2);
+    if (a0 > 0.01) {
+      const size = narrow ? W - 100 : Math.min(H - 140, W * 0.46);
+      drawMask(g, 40, 70, size, 20, 6, 10, a0);
+      g.text("query i sees keys max(s, i−127) … i", 40, 70 + size + 34, { size: 14, color: "ink", a: a0, weight: 600 });
+      // cost chart (beat 1)
+      const ca = s.at(1) * a0;
+      if (ca > 0.01) {
+        const gx0 = narrow ? 70 : 40 + size + 90, gx1 = W - 40, gy0 = narrow ? 70 + size + 70 : 90, gy1 = narrow ? H - 60 : 70 + size;
+        g.chart({ x0: gx0, y0: gy0, x1: gx1, y1: gy1, xmax: 60, ymax: 8000, xticks: [0, 20, 40, 60], yticks: [0, 4000, 8000], fy: (v) => (v / 1000) + "K", xlabel: "layers covered", ylabel: "tokens replayed", ylabelOff: 50,
+          series: [{ pts: [[0, 0], [10, 1280], [20, 2560], [40, 5120], [60, 7680]], color: "bad", dots: false }, { pts: [[0, 128], [60, 128]], color: "ok", dots: false }], a: ca, tsize: 12 });
+        g.text("exact", gx1 - 6, gy0 + 20, { size: 13, color: "bad", align: "right", weight: 600, a: ca });
+        g.text("bounded: 128", gx1 - 6, gy1 - 18, { size: 13, color: "ok", align: "right", weight: 600, a: ca });
+      }
+    }
+    const a2 = s.swapIn(2);
+    if (a2 > 0.01) {
+      const size = Math.min((W - 140) / 2, H - 180);
+      g.text("MASK MODE", 40, 70, { size: 18, font: "display", weight: 800, color: "compute", a: a2 });
+      drawMask(g, 40, 90, size, 16, 5, 8, a2, { label: false });
+      const cx = 100 + size;
+      g.text("COMPACT MODE", cx, 70, { size: 18, font: "display", weight: 800, color: "compute", a: a2 });
+      const cs = size / 16;
+      for (let i = 8; i < 16; i++) for (let j = 8; j <= i; j++) if (j >= i - 4) g.rect(cx + (j - 8) * cs + 1, 90 + (i - 8) * cs + 1, cs - 2, cs - 2, { fill: "ok", r: 3, a: a2 * 0.9 });
+      g.text("rows before s dropped", cx, 90 + 8 * cs + 24, { size: 13, color: "ink-3", a: a2 });
+      g.text("=", 70 + size, 90 + size / 2, { size: 40, color: "ink", align: "center", weight: 700, a: a2 });
+      g.text("L1: pivots, visible keys, store slots match · L2: logprobs and top-K match, element by element", 40, 90 + size + 40, { size: 13, color: "ok", weight: 600, a: a2 });
+    }
+  }, { anim: false });
+
+  /* ---------------- decoder replay ---------------- */
+  Atlas.scene("yoco", (g, s) => {
+    const { W, H } = g;
+    const x0 = 110, x1 = W - 40, top = 80, bot = H - 110, L = 40;
+    const rh = (bot - top) / L;
+    const keep = 0.06; // 140 of a long prompt, drawn wider for visibility
+    const a1 = s.at(1), a2 = s.at(2);
+    for (let l = 0; l < L; l++) {
+      const y = bot - (l + 1) * rh;
+      if (l < 20) g.rect(x0, y + 1, x1 - x0, rh - 2, { fill: "compute", r: 1, a: 0.75 * ramp(s.b, -0.5 + l * 0.02, 0.3) });
+      else {
+        g.rect(x0, y + 1, x1 - x0, rh - 2, { stroke: "memory", lw: 1, dash: [4, 4], r: 1, a: 0.6 });
+        g.rect(x1 - (x1 - x0) * keep, y + 1, (x1 - x0) * keep, rh - 2, { fill: "memory", r: 1, a: 0.9 * a1 });
+      }
+    }
+    g.text("early layers", x0 - 10, bot - 10 * rh, { size: 12, color: "compute", align: "right", weight: 600 });
+    g.text("whole prompt", x0 - 10, bot - 10 * rh + 16, { size: 11, color: "ink-3", align: "right" });
+    g.text("consumer", x0 - 10, bot - 30 * rh, { size: 12, color: "memory", align: "right", weight: 600 });
+    g.text("layers", x0 - 10, bot - 30 * rh + 16, { size: 12, color: "memory", align: "right", weight: 600 });
+    g.text("prompt tokens →", x1, bot + 22, { size: 12, color: "ink-3", align: "right" });
+    if (a1 > 0.01) g.dim(x1 - (x1 - x0) * keep, x1, top - 18, "140", { color: "memory", a: a1 });
+    if (a2 > 0.01) {
+      g.text("skipped: dashed area ≈ half of all prefill work", x0, bot + 56, { size: 16, color: "ok", weight: 600, a: a2 });
+      g.text("benchmark config: decoder bounded replay, 140 tokens", x0, bot + 80, { size: 13, color: "ink-3", a: a2 });
+    }
+  }, { anim: false });
+
+  /* ---------------- mask lab ---------------- */
+  Atlas.scene("mask", (g, s) => {
+    const st = s.state; if (st.ms === undefined) return;
+    const { W, H } = g;
+    const n = 24, size = Math.min(W - 160, H - 60);
+    const r = drawMask(g, 40, 30, size, n, st.mw, st.ms);
+    document.getElementById("m-lost").textContent = String(r.lost);
+    document.getElementById("m-rows").textContent = String(r.rows);
+    const lx = 60 + size;
+    g.rect(lx, 50, 14, 14, { fill: "compute", r: 3, a: 0.45 }); g.text("before s: cached", lx + 22, 62, { size: 12, color: "ink-2" });
+    g.rect(lx, 80, 14, 14, { fill: "ok", r: 3 }); g.text("replayed, visible", lx + 22, 92, { size: 12, color: "ink-2" });
+    g.rect(lx, 110, 14, 14, { stroke: "bad", lw: 1.5, r: 3 }); g.text("clipped", lx + 22, 122, { size: 12, color: "ink-2" });
+  }, { controls: "mask-ctl", format: (id, v) => String(v) });
+})();
+
+</script>
+<script>AtlasAlts.render("alts-replay", "sources-replay", "replay");</script>
+</body>
+</html>

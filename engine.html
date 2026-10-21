@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Anatomy of the engine · DeepInfer Annotated</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&display=swap">
+<link rel="stylesheet" href="atlas.css">
+</head>
+<body>
+<header class="bar">
+  <div class="wrap">
+    <a class="brand" href="index.html"><b>DeepInfer</b><span>annotated</span></a>
+    <nav aria-label="Chapters">
+      <a class="num" href="loop.html" title="The generation loop">01</a>
+      <a class="num" href="model.html" title="The model it serves">02</a>
+      <a class="num" href="engine.html" aria-current="page" title="Anatomy of the engine">03</a>
+      <a class="num" href="memory.html" title="KV memory">04</a>
+      <a class="num" href="scheduling.html" title="Scheduling a step">05</a>
+      <a class="num" href="parallelism.html" title="One model, many GPUs">06</a>
+      <a class="num" href="cluster.html" title="The cluster around it">07</a>
+      <a class="num" href="replay.html" title="Bounded replay">08</a>
+      <a class="num" href="speculation.html" title="Speculative decoding">09</a>
+      <a class="num" href="kernels.html" title="Numbers and kernels">10</a>
+      <a class="num" href="sampling.html" title="Sampling, structure, determinism">11</a>
+      <a class="num" href="frontdoor.html" title="The front door">12</a>
+      <a class="num" href="measure.html" title="Measuring it">13</a>
+      <a href="index.html">Map</a>
+    </nav>
+  </div>
+  <div class="progress"></div>
+</header>
+<main>
+  <section class="hero">
+    <div class="wrap">
+      <div>
+        <span class="eyebrow"><span class="n">03</span> The machine</span>
+        <h1>Anatomy <em>of a step</em></h1>
+        <p class="dek">One call to <code>engine.step()</code> crosses Python, C++ and every GPU in the group. This is the path, part by part, with the files that own each part.</p>
+        <div class="files">
+          <span class="tag">engine/llm_engine.py</span>
+          <span class="tag">csrc/engine/scheduler.hpp</span>
+          <span class="tag">csrc/engine/sequence.hpp</span>
+          <span class="tag">worker/worker.py</span>
+          <span class="tag">distributed/shm_broadcast.py</span>
+        </div>
+      </div>
+      <div class="board stage-card" data-stage="anat" data-label="Layered diagram: Python engine on top, C++ scheduler core in the middle, GPU workers at the bottom; a pulse travels down through scheduling and broadcast, runs on the workers, and returns as outputs.">
+        <span class="ruler">one engine step</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="path">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">The path of one step</span>
+        <h2>Six stops, three layers</h2>
+        <p class="lede">The Python layer orchestrates. The C++ core decides. The workers compute. Scroll to follow a step.</p>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">1 · add_request</span><h4>A prompt becomes a Sequence</h4><p><code>LLMEngine.add_request</code> builds a C++ <code>Sequence</code>: token ids, sampling scalars, KV-cache state, speculative-decoding state, structured-output state and a schedule state that starts at <code>WAITING</code>. It joins the scheduler's <code>waiting</code> queue.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">2 · schedule()</span><h4>The C++ scheduler decides</h4><p>Holding the block-manager lock (and releasing Python's GIL), the scheduler picks a prefill or a decode step, chooses sequences, allocates KV blocks and fills <code>SequenceMetadata</code> objects taken from an object pool. One pybind call, one decision.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">3 · broadcast</span><h4>Every GPU rank gets the same plan</h4><p>The driver worker publishes the step's inputs through a shared-memory ring buffer (<code>MessageQueue</code>, derived from vLLM) so other worker processes on the node read them without a socket round trip.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">4 · execute_model_step</span><h4>Forward, then catch up, then sample</h4><p>Each worker runs one fixed round: forward step N, post-process step N−1, sample step N, and, in decode with zero-overhead scheduling on, leave step N's post-processing for next time. The CPU work hides under the next forward.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">5 · model runner</span><h4>Graphs, model, sampler, drafter</h4><p>Decode steps replay a captured CUDA graph sized to the batch. The main model runs, then the sampler verifies last step's drafts, samples, and runs the DFlash drafter for the next step's proposals.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">6 · outputs</span><h4>Results flow back up</h4><p>C++ <code>process_outputs</code> appends accepted tokens, checks stop conditions and frees finished sequences. <code>RequestOutput</code> objects come from a pool and are reclaimed on the next step, which is why the Python loop clones what it keeps.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="path" data-label="Three swimlanes labelled Python, C++ core and GPU workers. Boxes for each stage light up in order as the step travels from add_request through scheduling, broadcast, execution and output processing."><span class="ruler">python · c++ · gpu</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="life">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Sequence lifecycle</span>
+        <h2>Every request is a small state machine</h2>
+        <p class="lede">A sequence waits, runs, and finishes for one of seven reasons. Preemption sends it back to waiting; chunked prefill keeps it waiting across several steps.</p>
+      </header>
+      <figure>
+        <div class="board fig-board" data-stage="life" data-label="State diagram: WAITING to RUNNING through one or more prefill chunks, RUNNING back to WAITING on preemption, and RUNNING to seven finished states: stopped, length capped, aborted, ignored, preempted, structured-output failed, vision-encoder failed."><span class="ruler">SequenceStatus · sequence.hpp</span></div>
+        <figcaption>Dots are sequences. A long prompt circles through WAITING once per prefill chunk until its last chunk lands. Preempted sequences return to the front of the queue and recompute. The finished states come straight from <code>enum class SequenceStatus</code>.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section class="section" id="types">
+    <div class="wrap stack">
+      <header>
+        <span class="eyebrow">Three engine types</span>
+        <h2>One engine, three jobs</h2>
+        <p class="lede">The same code runs as a combined engine, a prefill-only engine, or a decode-only engine. Disaggregated serving (chapter 07) uses the last two.</p>
+      </header>
+      <div class="split">
+        <figure>
+          <div class="board fig-board" data-stage="types" data-label="Three engine columns: NORMAL alternates prefill and decode steps; PROMPT runs only prefill and hands sequences off; COMPLETION receives them into a prompted queue and runs only decode."><span class="ruler">EngineType</span></div>
+          <figcaption>NORMAL engines interleave the two step kinds. PROMPT engines (PE) only prefill. COMPLETION engines (CE) receive prefilled sequences into a <code>prompted</code> queue and only decode.</figcaption>
+        </figure>
+        <div class="prose">
+          <p><b>NORMAL</b> engines vote every few decode steps on whether to prefill. Two kinds of checkpoints exist: at ALL points every data-parallel rank must have prefill work, so one busy rank doesn't drag the others into empty prompt steps; at ANY points a single rank with work triggers prefill, so an isolated rank waits at most that many steps.</p>
+          <p><b>PROMPT</b> engines return a (possibly empty) prefill result every step. In production they write KV to storage and pass sequences on.</p>
+          <p><b>COMPLETION</b> engines have no prefill path, so they can't recompute a preempted request. The scheduler refuses at startup to run a decode-only engine that would need to.</p>
+          <div class="code">
+            <div class="hd"><span>scheduler.hpp · _schedule (translated)</span><a href="https://github.com/deepseek-ai/DeepInfer/blob/main/csrc/engine/scheduler.hpp" target="_blank" rel="noopener">source</a></div>
+<pre><span class="c">// NORMAL engine: the whole DP group must take the same kind of step.</span>
+<span class="c">// ALL point: prefill only if every rank has prefill work.</span>
+<span class="c">// ANY point: prefill if any rank has work (bounded wait for a lone rank).</span>
+do_prefill = (_dp_allreduce(want ? 1 : 0, MIN) == 1);  <span class="c">// ALL</span>
+do_prefill = (_dp_allreduce(want ? 0 : 1, MIN) == 0);  <span class="c">// ANY</span>
+<span class="c">// second vote: did any rank actually schedule a prompt?</span>
+<span class="c">// if not, fall back to decode, or "running full + waiting</span>
+<span class="c">// non-empty" would loop forever on empty prompt steps.</span></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="cpp">
+    <div class="wrap stack">
+      <header>
+        <span class="eyebrow">Why C++</span>
+        <h2>The CPU is on the critical path</h2>
+      </header>
+      <div class="split">
+        <div class="prose">
+          <p>At decode speeds a step lasts a few tens of milliseconds, and the CPU must schedule, prepare inputs, and process outputs for hundreds of sequences inside it. vLLM measured that on a small model its GPU was busy only 38% of the time; the rest was API server and scheduler.</p>
+          <p>DeepInfer moves the per-sequence loops into C++: <code>Sequence</code>, <code>Scheduler</code>, <code>BlockManager</code>, the speculative-length scheduler and the asynchronous input preparation (<code>zos.cpp</code>). Python touches each step a handful of times, not once per sequence. Objects that are created every step, like <code>SequenceMetadata</code> and <code>RequestOutput</code>, come from object pools instead of the allocator.</p>
+          <p>A <code>DeferredRelease</code> helper in the engine holds onto pooled objects and pinned blocks until the GPU no longer needs them, then returns them in one batch.</p>
+        </div>
+        <div class="code">
+          <div class="hd"><span>worker.py · execute_model_step (docstring)</span><a href="https://github.com/deepseek-ai/DeepInfer/blob/main/deepinfer/worker/worker.py" target="_blank" rel="noopener">source</a></div>
+<pre><span class="c">"""The unified entry for model execution: every step</span>
+<span class="c">(prompt/decode, ZOS on/off, placeholder) goes through</span>
+<span class="c">this Forward-Post_process-Sample round.</span>
+<span class="c">  1. Forward current step (main model)</span>
+<span class="c">  2. Post-process previous step</span>
+<span class="c">  3. Sample current step</span>
+<span class="c">  4. Post-process current step: in place for prompt /</span>
+<span class="c">     non-ZOS steps; ZOS decode steps defer it to the</span>
+<span class="c">     next step to overlap with forward"""</span></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="others">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Other ways to do it</span>
+        <h2>Where other engines put the bookkeeping</h2>
+      </header>
+      <div class="compare" id="alts-engine"></div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap"><div class="sources" id="sources-engine"></div></div>
+  </section>
+
+</main>
+<nav class="next" aria-label="Chapter navigation">
+  <div class="wrap">
+    <a href="model.html"><span>← Chapter 02</span><b>The model it serves</b></a>
+    <a class="fwd" href="memory.html"><span>Chapter 04 →</span><b>KV memory</b></a>
+  </div>
+</nav>
+<script src="atlas.js"></script>
+<script src="alts.js"></script>
+<script>
+(function () {
+  const { ramp, ease, clamp, lerp } = Atlas;
+
+  /* ---------------- hero: layered machine ---------------- */
+  Atlas.scene("anat", (g, s) => {
+    const { W, H } = g;
+    const lanes = [["PYTHON", "cpu", ["LLM", "LLMEngine"]], ["C++ CORE", "cpu", ["Scheduler", "BlockManager", "zos prep"]], ["GPU WORKERS", "compute", []]];
+    const ly = [60, H * 0.36, H * 0.64], lh = Math.min(110, H * 0.2);
+    const cyc = 4.2, tt = (s.t % cyc) / cyc;
+    lanes.forEach(([name, c, items], i) => {
+      g.rect(30, ly[i], W - 60, lh, { fill: c, r: 10, a: 0.07 });
+      g.text(name, 46, ly[i] + 26, { size: 18, font: "display", weight: 800, color: c });
+      items.forEach((it, k) => g.box(200 + k * ((W - 260) / items.length), ly[i] + 22, (W - 260) / items.length - 16, lh - 44, { color: c, title: it, tsize: 14, tfont: "mono", tweight: 600, a: 0.95 }));
+    });
+    const nW = 8, ww = (W - 260) / nW;
+    for (let k = 0; k < nW; k++) {
+      const x = 200 + k * ww, y = ly[2] + 22, busy = tt > 0.42 && tt < 0.78;
+      g.rect(x, y, ww - 12, lh - 44, { fill: "compute", r: 6, a: busy ? 0.75 : 0.2 });
+      g.text("GPU " + k, x + (ww - 12) / 2, y + (lh - 44) / 2 + 5, { size: 12, color: busy ? "sheet" : "compute", align: "center", weight: 600 });
+    }
+    // pulse path
+    const P = (u) => {
+      const pts = [[200 + (W - 260) / 4, ly[0] + lh / 2], [200 + (W - 260) / 6, ly[1] + lh / 2], [W / 2, ly[1] + lh / 2]];
+      if (u < 0.15) return [lerp(pts[0][0], pts[1][0], u / 0.15), lerp(pts[0][1], pts[1][1], u / 0.15)];
+      if (u < 0.3) return [lerp(pts[1][0], pts[2][0], (u - 0.15) / 0.15), pts[1][1]];
+      return null;
+    };
+    const p = P(tt);
+    if (p) g.circle(p[0], p[1], 8, { fill: "ok", stroke: "sheet", lw: 2 });
+    if (tt >= 0.3 && tt < 0.42) {
+      const u = (tt - 0.3) / 0.12;
+      for (let k = 0; k < nW; k++) { const x = 200 + k * ww + (ww - 12) / 2; g.circle(lerp(W / 2, x, u), lerp(ly[1] + lh / 2, ly[2] + 22, u), 5, { fill: "ok" }); }
+      g.text("shared-memory broadcast", W / 2 + 12, (ly[1] + lh + ly[2]) / 2 + 4, { size: 13, color: "ok" });
+    }
+    if (tt >= 0.78) {
+      const u = (tt - 0.78) / 0.22;
+      g.circle(lerp(200 + 4, 200 + (W - 260) / 6, 1 - u * 0) , lerp(ly[2] + 22, ly[0] + lh / 2, u), 7, { fill: "memory", stroke: "sheet", lw: 2 });
+      g.text("outputs", 220, lerp(ly[2] + 22, ly[0] + lh / 2, u) + 4, { size: 13, color: "memory" });
+    }
+  }, { anim: true, restT: 1.5, zoom: 1.0, minW: 620 });
+
+  /* ---------------- path of a step ---------------- */
+  Atlas.scene("path", (g, s) => {
+    const { W, H, narrow } = g;
+    const b = s.b;
+    const top = 50, laneH = Math.min(110, H * 0.15), gap = 14;
+    const ly = [top, top + laneH + gap, top + 2 * (laneH + gap)];
+    const names = [["PYTHON", "cpu"], ["C++ CORE", "cpu"], ["GPU", "compute"]];
+    names.forEach(([n, c], i) => {
+      g.rect(20, ly[i], W - 40, laneH, { fill: c, r: 8, a: 0.06 });
+      g.text(n, 30, ly[i] + 18, { size: 12, color: c, weight: 600, ls: 1 });
+    });
+    const cols = 6, cx0 = narrow ? 30 : 90, cw = (W - cx0 - 30) / cols;
+    const box = (col, lane, span, title, beat, color) => {
+      const x = cx0 + col * cw + 4, y = ly[lane] + 24, w = cw * span - 8, h = laneH - 34;
+      const act = s.between(beat, beat + 1) + (beat === 5 ? s.at(5) : 0);
+      const done = b > beat + 0.5 ? 1 : 0;
+      g.box(x, y, w, h, { color, wash: 0.06 + 0.25 * act, lw: 1.2 + 2 * act, a: b >= beat - 0.6 || done ? 1 : 0.35 });
+      g.text(title, x + w / 2, y + h / 2 + 5, { size: narrow ? 11 : 13, color: act > 0.5 ? color : "ink", align: "center", weight: 600, a: b >= beat - 0.6 ? 1 : 0.4 });
+      return [x, y, w, h];
+    };
+    const A = box(0, 0, 1, "add_request", 0, "cpu");
+    const B = box(0, 1, 1, "Sequence", 0, "cpu");
+    const C = box(1, 1, 2, "Scheduler.schedule()", 1, "cpu");
+    const D = box(3, 1, 1, "shm queue", 2, "net");
+    const E = box(3, 2, 2, "execute_model_step", 3, "compute");
+    const F = box(5, 2, 1, "model runner", 4, "compute");
+    const G1 = box(5, 1, 1, "process_outputs", 5, "memory");
+    const G2 = box(5, 0, 1, "RequestOutput", 5, "memory");
+    const flow = (p, q, beat) => {
+      const a = b >= beat - 0.5 ? 1 : 0.25;
+      g.arrow(p[0], p[1], q[0], q[1], { color: "ink-3", lw: 1.5, head: 8, a });
+    };
+    flow([A[0] + A[2] / 2, A[1] + A[3]], [B[0] + B[2] / 2, B[1]], 0);
+    flow([B[0] + B[2], B[1] + B[3] / 2], [C[0], C[1] + C[3] / 2], 1);
+    flow([C[0] + C[2], C[1] + C[3] / 2], [D[0], D[1] + D[3] / 2], 2);
+    flow([D[0] + D[2] / 2, D[1] + D[3]], [E[0] + 20, E[1]], 3);
+    flow([E[0] + E[2], E[1] + E[3] / 2], [F[0], F[1] + F[3] / 2], 4);
+    flow([F[0] + F[2] / 2, F[1]], [G1[0] + G1[2] / 2, G1[1] + G1[3]], 5);
+    flow([G1[0] + G1[2] / 2, G1[1]], [G2[0] + G2[2] / 2, G2[1] + G2[3]], 5);
+    // detail inset
+    const iy = ly[2] + laneH + 30, ih = H - iy - 20, ix = 30, iw = W - 60;
+    g.rect(ix, iy, iw, ih, { fill: "paper", stroke: "hair", r: 10 });
+    const d = (i) => s.solo(i);
+    // 0: sequence fields
+    if (d(0) > 0.01) {
+      const a = d(0);
+      g.text("struct Sequence", ix + 20, iy + 30, { size: 15, color: "cpu", weight: 600, a });
+      const fields = [["data", "token ids"], ["sampling", "temperature, top-k/p, seed"], ["mtp", "drafts, accept rates"], ["cache", "block table, cached tokens"], ["structured_output", "matcher status"], ["schedule", "status = WAITING"]];
+      fields.forEach(([k, v], i) => {
+        const col = i % 2, row = Math.floor(i / 2);
+        const x = ix + 20 + col * (iw / 2), y = iy + 62 + row * 34;
+        g.text(k, x, y, { size: 13, color: "ink", weight: 600, a });
+        g.text(v, x + 150, y, { size: 13, color: "ink-3", a });
+      });
+    }
+    // 1: queues
+    if (d(1) > 0.01) {
+      const a = d(1), y = iy + 40;
+      g.text("waiting", ix + 20, y, { size: 13, color: "ink-3", a });
+      for (let k = 0; k < 7; k++) g.rect(ix + 20 + k * 30, y + 10, 24, 24, { fill: k < 2 ? "compute" : "grid", r: 4, a });
+      g.arrow(ix + 240, y + 22, ix + 300, y + 22, { color: "ink-3", head: 8, a });
+      g.text("running", ix + 310, y, { size: 13, color: "ink-3", a });
+      for (let k = 0; k < 9; k++) g.rect(ix + 310 + k * 30, y + 10, 24, 24, { fill: k < 7 ? "memory" : "grid", r: 4, a });
+      g.chip(ix + 20, y + 72, "DP vote: prefill or decode?", "cpu", { a, size: 13 });
+      g.chip(ix + 280, y + 72, "allocate KV blocks + state slot", "memory", { a, size: 13 });
+      g.text("SequenceMetadata objects come from a pool", ix + 20, y + 110, { size: 13, color: "ink-3", a });
+    }
+    // 2: ring buffer
+    if (d(2) > 0.01) {
+      const a = d(2), cx = ix + 110, cy = iy + ih / 2, R = Math.min(60, ih / 2 - 16);
+      for (let k = 0; k < 10; k++) {
+        const ang = (k / 10) * Math.PI * 2 - Math.PI / 2;
+        g.circle(cx + R * Math.cos(ang), cy + R * Math.sin(ang), 10, { fill: k <= (Math.floor(s.t * 3) % 10) ? "net" : "grid", a });
+      }
+      g.text("ShmRingBuffer", cx, cy + 5, { size: 12, color: "net", align: "center", weight: 600, a });
+      for (let r = 0; r < 4; r++) { const x = ix + 260 + r * Math.min(130, (iw - 280) / 4); g.box(x, cy - 24, Math.min(110, (iw - 300) / 4), 48, { color: "compute", title: "worker " + (r + 1), tsize: 13, tfont: "mono", tweight: 600, a }); g.arrow(cx + R + 14, cy, x - 4, cy, { color: "net", lw: 1, head: 7, a: a * 0.5 }); }
+      g.text("readers on the node map the same memory; remote readers use ZMQ", ix + 20, iy + ih - 16, { size: 12, color: "ink-3", a });
+    }
+    // 3: worker round
+    if (d(3) > 0.01) {
+      const a = d(3), y = iy + 50, x0 = ix + 20, sc = (iw - 40) / 10;
+      const segs = [[0, 3.2, "forward N", "compute"], [3.2, 1.4, "post N−1", "cpu"], [4.6, 1.6, "sample N", "ok"], [6.2, 3.2, "forward N+1", "compute"], [9.4, 0.6, "…", "ink-3"]];
+      segs.forEach(([st, ln, lab, c]) => { g.rect(x0 + st * sc, y, ln * sc - 4, 34, { fill: c, r: 5, a: a * 0.8 }); g.text(lab, x0 + (st + ln / 2) * sc, y + 22, { size: 12, color: "sheet", align: "center", weight: 600, a }); });
+      g.rect(x0 + 6.2 * sc, y + 44, 1.4 * sc - 4, 30, { stroke: "cpu", dash: [4, 4], r: 5, a });
+      g.text("post N (deferred)", x0 + 6.9 * sc, y + 64, { size: 12, color: "cpu", align: "center", a });
+      g.text("in decode with ZOS on, post-processing hides under the next forward", x0, iy + ih - 16, { size: 12, color: "ink-3", a });
+    }
+    // 4: graph ladder
+    if (d(4) > 0.01) {
+      const a = d(4), y = iy + 50;
+      const sizes = [1, 2, 4, 8, 16, 32, 48, 64, 80, 96];
+      let x = ix + 20;
+      sizes.forEach((sz) => { const sel = sz === 32; x += g.pill(x, y, String(sz), { size: 13, color: sel ? "sheet" : "compute", fill: sel ? "compute" : "sheet", stroke: "compute", a }) + 6; });
+      g.text("batch of 23 tokens → replay the graph captured for 32, padded", ix + 20, y + 44, { size: 13, color: "ink", a });
+      g.text("main model → sampler (verify drafts, sample) → DFlash drafter (next drafts)", ix + 20, y + 72, { size: 13, color: "ink-3", a });
+    }
+    // 5: outputs
+    if (d(5) > 0.01) {
+      const a = d(5), y = iy + 40;
+      g.text("append accepted tokens · check stop strings, EOS, max length · free finished", ix + 20, y, { size: 13, color: "ink", a });
+      for (let k = 0; k < 10; k++) { const used = k < 6; g.rect(ix + 20 + k * 34, y + 22, 28, 28, { fill: used ? "memory" : "grid", r: 4, a }); }
+      g.text("RequestOutput pool: released at the next step", ix + 380, y + 42, { size: 13, color: "memory", a });
+      g.text("the Python loop clones what it keeps", ix + 20, y + 80, { size: 13, color: "ink-3", a });
+    }
+  }, { anim: true, restT: 1 });
+
+  /* ---------------- lifecycle ---------------- */
+  const FIN = ["STOPPED", "LENGTH_CAPPED", "ABORTED", "IGNORED", "PREEMPTED", "SO_FAILED", "VE_FAILED"];
+  Atlas.scene("life", (g, s) => {
+    const { W, H, narrow } = g;
+    const wx = narrow ? 90 : W * 0.14, rx = narrow ? W * 0.45 : W * 0.45, fx = W - (narrow ? 150 : 230), cy = H * 0.48;
+    g.box(wx - 70, cy - 36, 140, 72, { color: "cpu", title: "WAITING", tsize: 22 });
+    g.box(rx - 70, cy - 36, 140, 72, { color: "compute", title: "RUNNING", tsize: 22 });
+    const fy0 = 50, fh = (H - 100) / FIN.length;
+    FIN.forEach((f, i) => g.pill(fx, fy0 + i * fh + fh / 2, f, { size: narrow ? 12 : 14, color: f === "STOPPED" ? "ok" : "ink-2", stroke: f === "STOPPED" ? "ok" : "hair" }));
+    g.text("FINISHED_*", fx, fy0 - 14, { size: 13, color: "ink-3" });
+    // edges
+    g.curve([wx + 70, cy - 10], [(wx + rx) / 2, cy - 60], [rx - 70, cy - 10], { color: "compute", lw: 2 });
+    g.text("last prefill chunk", (wx + rx) / 2, cy - 54, { size: 13, color: "compute", align: "center" });
+    g.curve([rx - 60, cy + 36], [(wx + rx) / 2, cy + 110], [wx + 60, cy + 36], { color: "bad", lw: 2 });
+    g.text("preempted → recompute", (wx + rx) / 2, cy + 104, { size: 13, color: "bad", align: "center" });
+    // self loops
+    g.curve([wx - 30, cy - 36], [wx, cy - 120], [wx + 30, cy - 36], { color: "cpu", lw: 1.8 });
+    g.text("chunk done, more remain", wx, cy - 124, { size: 12, color: "cpu", align: "center" });
+    g.curve([rx - 30, cy - 36], [rx, cy - 120], [rx + 30, cy - 36], { color: "compute", lw: 1.8 });
+    g.text("decode step", rx, cy - 124, { size: 12, color: "compute", align: "center" });
+    FIN.forEach((f, i) => {
+      const from = (f === "IGNORED" || f === "VE_FAILED") ? [wx + 50, cy + 30] : [rx + 70, cy];
+      g.line(from[0], from[1], fx - 4, fy0 + i * fh + fh / 2, { color: "hair", lw: 1.2 });
+    });
+    // moving dots: deterministic scripts
+    const scripts = [
+      ["w", "w", "r", "r", "r", "r", 0], ["w", "r", "r", "r", "p", "w", "r", "r", 0], ["w", "r", "r", "r", "r", "r", 1], ["w", "w", "w", "r", "r", 0], ["w", "x", 3], ["w", "r", "r", 2],
+    ];
+    const pos = (st) => st === "w" ? [wx, cy] : st === "r" ? [rx, cy] : null;
+    scripts.forEach((sc, k) => {
+      const end = sc[sc.length - 1];
+      const steps = sc.slice(0, -1);
+      const per = 0.9, cycle = (steps.length + 2) * per;
+      const tt = (s.t + k * 1.7) % cycle;
+      const i = Math.floor(tt / per), u = ease((tt % per) / per);
+      const jitter = (k - 2.5) * 6;
+      let p;
+      if (i < steps.length - 1) {
+        const A0 = steps[i] === "p" ? pos("r") : pos(steps[i]), B0 = steps[i + 1] === "p" ? pos("w") : steps[i + 1] === "x" ? [fx, fy0 + 3 * fh + fh / 2] : pos(steps[i + 1]);
+        if (steps[i] === steps[i + 1]) { const c = pos(steps[i]); const ang = -Math.PI / 2 + Math.sin(u * Math.PI) * 0; p = [c[0] + Math.sin(u * Math.PI * 2) * 30, c[1] - 36 - Math.sin(u * Math.PI) * 70]; }
+        else p = [lerp(A0[0], B0[0], u), lerp(A0[1], B0[1], u) + (steps[i + 1] === "w" && steps[i] === "p" ? Math.sin(u * Math.PI) * 70 : 0)];
+      } else if (i === steps.length - 1) {
+        const A0 = pos(steps[i]) || [fx, fy0 + 3 * fh + fh / 2], B0 = [fx - 10, fy0 + end * fh + fh / 2];
+        p = [lerp(A0[0], B0[0], u), lerp(A0[1], B0[1], u)];
+      } else { p = [fx - 10, fy0 + end * fh + fh / 2]; }
+      g.circle(p[0], p[1] + jitter * 0.3, 7, { fill: ["ok", "memory", "compute", "net", "bad", "cpu"][k], stroke: "sheet", lw: 2 });
+    });
+  }, { anim: true, restT: 2.8 });
+
+  /* ---------------- engine types ---------------- */
+  Atlas.scene("types", (g, s) => {
+    const { W, H } = g;
+    const cols = [["NORMAL", "mix"], ["PROMPT · PE", "pre"], ["COMPLETION · CE", "dec"]];
+    const cw = (W - 60) / 3;
+    cols.forEach(([name, kind], i) => {
+      const x = 30 + i * cw;
+      g.text(name, x + 8, 50, { size: 20, font: "display", weight: 800, color: kind === "pre" ? "compute" : kind === "dec" ? "memory" : "ink" });
+      const n = 14, bh = (H - 140) / n;
+      for (let k = 0; k < n; k++) {
+        const step = Math.floor(s.t * 2) + k;
+        const isPre = kind === "pre" || (kind === "mix" && step % 8 === 0);
+        g.rect(x + 8, 70 + k * bh, cw - 40, bh - 5, { fill: isPre ? "compute" : "memory", r: 4, a: 0.25 + 0.6 * (k === 0 ? 1 : 0.5) });
+      }
+    });
+    const tt = (s.t % 2) / 2;
+    for (let k = 0; k < 3; k++) {
+      const u = (tt + k / 3) % 1;
+      const x = lerp(30 + cw + cw - 40, 30 + 2 * cw + 8, u), y = 90 + k * 60 + Math.sin(u * Math.PI) * -20;
+      g.circle(x, y, 6, { fill: "ok", stroke: "sheet", lw: 2 });
+    }
+    g.text("sequence + KV hand-off", 30 + 2 * cw - 20, H - 40, { size: 13, color: "ok", align: "center" });
+    g.text("time ↓", W - 30, H - 40, { size: 12, color: "ink-3", align: "right" });
+  }, { anim: true, restT: 1.2 });
+})();
+
+</script>
+<script>AtlasAlts.render("alts-engine", "sources-engine", "engine");</script>
+</body>
+</html>

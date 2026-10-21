@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>KV memory · DeepInfer Annotated</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&display=swap">
+<link rel="stylesheet" href="atlas.css">
+</head>
+<body>
+<header class="bar">
+  <div class="wrap">
+    <a class="brand" href="index.html"><b>DeepInfer</b><span>annotated</span></a>
+    <nav aria-label="Chapters">
+      <a class="num" href="loop.html" title="The generation loop">01</a>
+      <a class="num" href="model.html" title="The model it serves">02</a>
+      <a class="num" href="engine.html" title="Anatomy of the engine">03</a>
+      <a class="num" href="memory.html" aria-current="page" title="KV memory">04</a>
+      <a class="num" href="scheduling.html" title="Scheduling a step">05</a>
+      <a class="num" href="parallelism.html" title="One model, many GPUs">06</a>
+      <a class="num" href="cluster.html" title="The cluster around it">07</a>
+      <a class="num" href="replay.html" title="Bounded replay">08</a>
+      <a class="num" href="speculation.html" title="Speculative decoding">09</a>
+      <a class="num" href="kernels.html" title="Numbers and kernels">10</a>
+      <a class="num" href="sampling.html" title="Sampling, structure, determinism">11</a>
+      <a class="num" href="frontdoor.html" title="The front door">12</a>
+      <a class="num" href="measure.html" title="Measuring it">13</a>
+      <a href="index.html">Map</a>
+    </nav>
+  </div>
+  <div class="progress"></div>
+</header>
+<main>
+  <section class="hero">
+    <div class="wrap">
+      <div>
+        <span class="eyebrow"><span class="n">04</span> Memory</span>
+        <h1>KV memory, <em>one block at a time</em></h1>
+        <p class="dek">Nobody knows how long an answer will be, so KV can't be reserved up front. DeepInfer hands it out in 128-token blocks, and keeps the sliding window in a second, fixed-size allocator of its own.</p>
+        <div class="files">
+          <span class="tag">csrc/engine/block_manager.hpp</span>
+          <span class="tag">worker/cache_engine.py</span>
+          <span class="tag">tilelang_ops/state_cache.py</span>
+          <span class="tag">tilelang_ops/store_kv_cache.py</span>
+        </div>
+      </div>
+      <div class="board stage-card" data-stage="pool" data-label="A grid of physical KV blocks. Several requests grow by claiming blocks from a free list; one request forks and shares its parent's blocks; finished requests return their blocks.">
+        <span class="ruler">physical blocks · 128 tokens each</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="paging">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Paging</span>
+        <h2>Borrowed from operating systems</h2>
+        <p class="lede">The idea vLLM introduced in 2023 and that every serious engine now uses: treat KV memory like virtual memory pages.</p>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">The problem</span><h4>Reserving for the worst case wastes most of it</h4><p>If each request reserves room for its maximum length, most of that room is never written: a request allowed 32K tokens that stops at 2K leaves 94% of its slab empty, and no one else can use it.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Blocks</span><h4>Fixed-size pages and a table</h4><p>Memory is cut into equal blocks of 128 token positions. Each sequence keeps a <i>block table</i>: logical block 0, 1, 2… mapped to whatever physical blocks it was given. Attention kernels read through the table, so the blocks never need to be contiguous.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Free list</span><h4>A doubly linked list of free block ids</h4><p>The C++ <code>Blocks</code> structure links every free block to the next. Allocating pops from the head; freeing pushes on the tail; each block carries a reference count. Block 0 is never handed out, so 0 in a table means "empty".</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Forks</span><h4>Share full blocks, copy the tail</h4><p>When a request forks (several samples from one prompt), the child points at the parent's full blocks and bumps their reference counts. Only the partially written last block is copied, so both branches can keep writing. The windowed state slot is cloned too.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Preemption</span><h4>Out of blocks? Give some back</h4><p>Decode needs a new block whenever a sequence crosses a 128-token boundary. If none are free, the scheduler preempts a running sequence: frees its blocks, resets its counters and puts it back at the front of the waiting queue to recompute. Structured-output requests are stopped instead, because their grammar state can't be replayed.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="paging" data-label="Diagram progressing from contiguous per-request slabs with wasted space, to a grid of physical blocks mapped from per-request block tables, a linked free list, a fork sharing blocks and copying a tail block, and a preemption freeing blocks."><span class="ruler">GPU memory</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="state">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">The second allocator</span>
+        <h2>One fixed slot per sequence</h2>
+        <p class="lede">Sliding-window KV never grows past the window, so it doesn't need pages. It needs exactly one slot per running sequence.</p>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">StateBlock</span><h4>A ring buffer per layer</h4><p>Each sequence owns one state slot. Inside, every layer keeps a ring buffer of the last 128 window positions plus 6 spare positions that absorb speculative backtracking and copy overshoot. Writes wrap around; the window never grows.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Two regions</span><h4>What gets saved and what gets dropped</h4><p>The slot is split in two: a <b>stored</b> region with the window of the first 20 layers, which is worth saving across requests, and a <b>dropped</b> region with the consumer layers' windows and the compression accumulators, which are cheaper to rebuild than to store (chapter 08).</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Joint admission</span><h4>Blocks and a slot, or nothing</h4><p>A request is admitted only if both the paged blocks <i>and</i> a state slot are available. If the slot can't be had, the scheduler treats it as "try later" even when blocks are free. Slot 0, like block 0, is reserved: CUDA-graph padding rows write there harmlessly.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="slot" data-label="One sequence's state slot drawn as rows of ring buffers, one per layer, with a write pointer wrapping around 134 positions; a divider separates the stored region of the first 20 layers from the dropped region."><span class="ruler">state cache · one sequence</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="lab">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Try it</span>
+        <h2>How many requests fit?</h2>
+        <p class="lede">Same GPU memory, two allocation policies. Change the length limit and how long answers really are.</p>
+      </header>
+      <div class="lab">
+        <div class="controls" id="frag-ctl">
+          <div class="ctl"><label for="mem">KV memory on the GPU (GB) <output for="mem">40</output></label><input type="range" id="mem" min="10" max="120" step="5" value="40"></div>
+          <div class="ctl"><label for="maxlen">Max tokens per request <output for="maxlen">32K</output></label><input type="range" id="maxlen" min="2" max="7" step="1" value="5"></div>
+          <div class="ctl"><label for="mean">Average actual length <output for="mean">3K</output></label><input type="range" id="mean" min="0.5" max="32" step="0.5" value="3"></div>
+          <div class="ctl"><label for="kvt">KV bytes per token <output for="kvt">70 KB</output></label><input type="range" id="kvt" min="1" max="320" step="1" value="70"></div>
+          <div class="readout">
+            <div><b id="f-con">–</b><span>requests · contiguous</span></div>
+            <div><b id="f-pag">–</b><span>requests · paged</span></div>
+          </div>
+          <p class="note">Paged allocation rounds each request up to whole 128-token blocks; contiguous allocation reserves the maximum. Lengths here are averages, so real batches vary.</p>
+        </div>
+        <div class="board" data-stage="frag" data-label="Two memory bars: contiguous reservations filled with mostly empty slabs versus paged blocks packed with many more requests."><span class="ruler">same memory, two policies</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="code">
+    <div class="wrap stack">
+      <header>
+        <span class="eyebrow">In the repo</span>
+        <h2>The free list, in full</h2>
+      </header>
+      <div class="split">
+        <div class="code">
+          <div class="hd"><span>csrc/engine/block_manager.hpp · Blocks</span><a href="https://github.com/deepseek-ai/DeepInfer/blob/main/csrc/engine/block_manager.hpp" target="_blank" rel="noopener">source</a></div>
+<pre><span class="k">struct</span> Blocks { <span class="c">// GPU block 0 is unused, so 0 means "empty"</span>
+    Blocks(<span class="k">int</span> _n) : _blocks(_n), _head(<span class="n">1</span>), _tail(_n - <span class="n">1</span>), _size(_n - <span class="n">1</span>) {
+        <span class="k">for</span> (<span class="k">int</span> i = <span class="n">1</span>; i &lt; _n; ++i) {
+            _blocks[i].prev = i - <span class="n">1</span>;
+            _blocks[i].next = i + <span class="n">1</span>;
+        }
+        _blocks[_n - <span class="n">1</span>].next = <span class="n">0</span>;
+    }
+    <span class="k">int</span> allocate() { <span class="k">int</span> id = _pop_front(); <span class="c">/* ref_count 0 checked */</span> ... }
+    <span class="k">void</span> pin_block(<span class="k">int</span> id);   <span class="c">// ref_count++ (forks, in-flight copies)</span>
+    <span class="k">void</span> free(<span class="k">int</span> id);        <span class="c">// ref_count--; back on the list at 0</span>
+};</pre>
+        </div>
+        <div class="prose">
+          <p><b>Why a linked list?</b> Allocation and freeing are O(1) and touch only a few integers. With thousands of blocks and hundreds of sequences per step, that matters on a CPU that is already on the critical path.</p>
+          <p><b>Why recompute instead of swap?</b> Swapping a preempted request's KV to host memory and back costs PCIe bandwidth and bookkeeping. Preemptions are rare when the scheduler admits carefully, and V4.1's KV is small, so recomputing is simpler. vLLM V1 and SGLang made the same call.</p>
+          <p><b>Where is the prefix cache?</b> Not in this release. In production, cross-request reuse goes through a shared storage cluster instead of an in-engine hash table (chapter 07).</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="others">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Other ways to do it</span>
+        <h2>Paging, trees, and pools</h2>
+      </header>
+      <div class="compare" id="alts-memory"></div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap"><div class="sources" id="sources-memory"></div></div>
+  </section>
+
+</main>
+<nav class="next" aria-label="Chapter navigation">
+  <div class="wrap">
+    <a href="engine.html"><span>← Chapter 03</span><b>Anatomy of the engine</b></a>
+    <a class="fwd" href="scheduling.html"><span>Chapter 05 →</span><b>Scheduling a step</b></a>
+  </div>
+</nav>
+<script src="atlas.js"></script>
+<script src="alts.js"></script>
+<script>
+(function () {
+  const { ramp, ease, clamp, lerp, rng } = Atlas;
+  const REQC = ["compute", "memory", "cpu", "net", "ok"];
+
+  /* ---------------- hero: block pool ---------------- */
+  Atlas.scene("pool", (g, s) => {
+    const { W, H } = g;
+    const cols = 14, rows = 8, gx = 40, gy = 60;
+    const cw = (W - 80) / cols, ch = Math.min(cw * 0.8, (H - 150) / rows);
+    const N = cols * rows;
+    const R = rng(11);
+    const perm = Array.from({ length: N - 1 }, (_, i) => i + 1).sort(() => R() - 0.5);
+    const cyc = 12, tt = s.t % cyc;
+    // four requests with start/end times and growth rates; request 3 forks from 0
+    const reqs = [[0, 9, 1.4], [1.2, 11, 1.0], [2.5, 7.5, 1.8], [4, 12, 0.9]];
+    const owner = new Array(N).fill(-1);
+    let p = 0;
+    const tables = [];
+    reqs.forEach(([st, en, rate], k) => {
+      const len = tt < st ? 0 : tt > en ? 0 : Math.min(12, Math.floor(1 + (tt - st) * rate));
+      const blocks = [];
+      for (let j = 0; j < 12; j++) { const b = perm[p++]; if (j < len) { owner[b] = k; blocks.push(b); } }
+      tables.push(blocks);
+    });
+    for (let i = 0; i < N; i++) {
+      const r_ = Math.floor(i / cols), q = i % cols;
+      const x = gx + q * cw, y = gy + r_ * ch;
+      const o = owner[i];
+      g.rect(x + 2, y + 2, cw - 4, ch - 4, { fill: i === 0 ? "paper" : o < 0 ? "grid" : REQC[o], r: 4, a: o < 0 ? 1 : 0.8 });
+      if (i === 0) g.text("0", x + cw / 2, y + ch / 2 + 4, { size: 11, color: "ink-3", align: "center" });
+    }
+    const free = owner.filter((o, i) => o < 0 && i > 0).length;
+    g.text(`free blocks: ${free} / ${N - 1}`, gx, H - 50, { size: 15, color: "ink-2", weight: 600 });
+    tables.forEach((t, k) => { if (t.length) g.chip(gx + 230 + k * 92, H - 55, `req ${k + 1}: ${t.length}`, REQC[k], { size: 12 }); });
+  }, { anim: true, restT: 6, zoom: 1.0, minW: 560 });
+
+  /* ---------------- paging story ---------------- */
+  Atlas.scene("paging", (g, s) => {
+    const { W, H, narrow } = g;
+    const b = s.b;
+    const slabA = s.swapOut(1);
+    // beat 0: contiguous slabs
+    if (slabA > 0.01) {
+      const a = slabA, y0 = 80, rowH = (H - 200) / 4;
+      g.text("CONTIGUOUS · reserve the maximum", 30, 56, { size: 20, font: "display", weight: 800, color: "bad", a });
+      [[0.06, "2K used of 32K"], [0.22, "7K used of 32K"], [0.4, "13K used of 32K"], [0.1, "3K used of 32K"]].forEach(([u, lab], k) => {
+        const y = y0 + k * rowH, x0 = 30, w = W - 60;
+        g.rect(x0, y, w, rowH - 24, { fill: "sheet", stroke: REQC[k], lw: 1.5, r: 6, a });
+        g.rect(x0, y, w * u, rowH - 24, { fill: REQC[k], r: 6, a: a * 0.8 });
+        g.hatch(x0 + w * u + 2, y + 2, w * (1 - u) - 4, rowH - 28, { color: "bad", a: a * 0.6 });
+        g.text(lab, x0 + w * u + 12, y + (rowH - 24) / 2 + 5, { size: 14, color: "ink", weight: 600, a });
+      });
+      g.text("hatched = reserved, never written, unusable by anyone else", 30, H - 50, { size: 14, color: "bad", a });
+    }
+    if (s.swapIn(1) <= 0.01) return;
+    const A1 = s.swapIn(1);
+    // layout
+    const tx0 = 30, tw = narrow ? W - 60 : W * 0.36;
+    const gx0 = narrow ? 30 : W * 0.42, gy0 = narrow ? H * 0.42 : 70, gw = narrow ? W - 60 : W * 0.58 - 30;
+    const cols = 10, rows = narrow ? 6 : 9, cw = gw / cols, ch = Math.min(cw * 0.78, ((narrow ? H * 0.5 : H - 130) / rows));
+    const N = cols * rows;
+    const tables = { A: [12, 3, 27, 41, 58], B: [7, 33, 50, 71], C: [19, 64, 85] };
+    const fork = s.at(3), pre = s.at(4);
+    if (fork > 0.5) tables["A′"] = [12, 3, 27, 41, 9];
+    const owner = {};
+    Object.entries(tables).forEach(([k, bl]) => bl.forEach((x) => { owner[x] = owner[x] ? owner[x] + "+" + k : k; }));
+    const colorOf = { A: "compute", B: "memory", C: "cpu", "A′": "net" };
+    // free list order
+    const freeIds = [];
+    for (let i = 1; i < N; i++) if (!owner[i] || (pre > 0.5 && owner[i] === "C")) freeIds.push(i);
+    const cellXY = (i) => [gx0 + (i % cols) * cw, gy0 + Math.floor(i / cols) * ch];
+    for (let i = 0; i < N; i++) {
+      const [x, y] = cellXY(i);
+      const o = owner[i];
+      let fill = i === 0 ? "paper" : "grid", a = A1;
+      if (o) {
+        const first = o.split("+")[0];
+        fill = colorOf[first];
+        if (first === "C" && pre > 0) a = A1 * (1 - pre * 0.8);
+      }
+      g.rect(x + 2, y + 2, cw - 4, ch - 4, { fill, r: 4, a: o ? a * 0.85 : a });
+      if (o && o.includes("+")) { g.rect(x + (cw - 4) / 2 + 2, y + 2, (cw - 4) / 2, ch - 4, { fill: "net", r: 4, a: A1 * fork }); g.text("×2", x + cw / 2, y + ch / 2 + 4, { size: 11, color: "sheet", weight: 700, align: "center", a: fork }); }
+      g.text(String(i), x + 6, y + 14, { size: 9, color: o ? "sheet" : "ink-3", a: A1 * 0.8 });
+    }
+    // block tables
+    const ty0 = narrow ? 70 : 90, tRow = narrow ? 52 : 70;
+    Object.entries(tables).forEach(([k, bl], r) => {
+      const y = ty0 + r * tRow;
+      const a = A1 * (k === "C" ? 1 - pre : 1) * (k === "A′" ? fork : 1);
+      g.text("req " + k, tx0, y + 22, { size: 14, color: colorOf[k], weight: 700, a });
+      bl.forEach((x, j) => {
+        const isCopy = k === "A′" && j === bl.length - 1;
+        g.rect(tx0 + 70 + j * 46, y, 40, 32, { fill: "sheet", stroke: isCopy ? "ok" : colorOf[k], lw: isCopy ? 2.5 : 1.4, r: 5, a });
+        g.text(String(x), tx0 + 90 + j * 46, y + 21, { size: 13, color: "ink", align: "center", weight: 600, a });
+      });
+    });
+    g.text("block tables", tx0, ty0 - 18, { size: 13, color: "ink-3", a: A1 });
+    // arrows for A (beat 1)
+    const arA = s.between(1, 2);
+    tables.A.forEach((blk, j) => {
+      const [x, y] = cellXY(blk);
+      g.curve([tx0 + 90 + j * 46, ty0], [lerp(tx0 + 90 + j * 46, x, 0.5), Math.min(ty0, y) - 30], [x + cw / 2, y + 2], { color: "compute", lw: 1.4, a: arA * 0.8, head: 7 });
+    });
+    // free list chain (beat 2)
+    const fl = s.between(2, 3);
+    if (fl > 0.01) {
+      const pts = freeIds.slice(0, 24).map((i) => { const [x, y] = cellXY(i); return [x + cw / 2, y + ch / 2]; });
+      g.poly(pts, { color: "ink-2", lw: 1.4, a: fl * 0.7, dash: [4, 4] });
+      g.chip(pts[0][0] - 20, pts[0][1] - ch * 0.7, "head", "ok", { a: fl, size: 12 });
+      const fly = (s.t % 2.4) / 2.4;
+      const [hx, hy] = pts[0];
+      g.circle(lerp(hx, tx0 + 90 + 5 * 46, ease(fly)), lerp(hy, ty0 + 16, ease(fly)), 7, { fill: "ok", a: fl });
+      g.text("allocate = pop the head · free = push on the tail", narrow ? 30 : gx0, H - 34, { size: 13, color: "ink-2", a: fl });
+    }
+    if (fork > 0.01 && pre < 0.5) {
+      g.text("fork: share full blocks (ref count 2), copy the partial tail block", narrow ? 30 : gx0, H - 34, { size: 13, color: "net", a: fork * (1 - pre) });
+      const [x, y] = cellXY(9);
+      g.rect(x + 1, y + 1, cw - 2, ch - 2, { stroke: "ok", lw: 3, r: 5, a: fork });
+    }
+    if (pre > 0.01) {
+      g.text("no free block → preempt req C → its blocks return to the free list", narrow ? 30 : gx0, H - 34, { size: 13, color: "bad", a: pre });
+      g.box(tx0, ty0 + 4 * tRow + 6, Math.min(tw, 300), 46, { color: "cpu", dash: [6, 5], a: pre, title: "C → waiting (recompute)", tsize: 14, tfont: "mono", tweight: 600 });
+    }
+  }, { anim: true, restT: 1 });
+
+  /* ---------------- state slot ---------------- */
+  Atlas.scene("slot", (g, s) => {
+    const { W, H, narrow } = g;
+    const x0 = narrow ? 70 : 120, x1 = W - 40, n = 134;
+    const rowsShown = 40, top = 70, bot = H - (s.at(2) > 0.3 ? 170 : 70);
+    const rh = (bot - top) / (rowsShown + 2);
+    const cw = (x1 - x0) / n;
+    const head = Math.floor(s.t * 14) % n;
+    for (let l = 0; l < rowsShown; l++) {
+      const y = top + l * rh + (l >= 20 ? rh * 1.6 : 0);
+      const stored = l < 20;
+      const reg = s.at(1);
+      const c = reg > 0.3 ? (stored ? "memory" : "ink-3") : "memory";
+      g.rect(x0, y, x1 - x0, rh - 1.5, { fill: "grid", r: 1 });
+      // window = 128 positions ending at head (wrap)
+      const st = (head - 127 + n) % n;
+      if (st <= head) g.rect(x0 + st * cw, y, (head - st + 1) * cw, rh - 1.5, { fill: c, a: 0.55 });
+      else { g.rect(x0, y, (head + 1) * cw, rh - 1.5, { fill: c, a: 0.55 }); g.rect(x0 + st * cw, y, (n - st) * cw, rh - 1.5, { fill: c, a: 0.55 }); }
+      g.rect(x0 + head * cw, y, Math.max(2, cw), rh - 1.5, { fill: "compute" });
+    }
+    g.text("layer 0", x0 - 10, top + rh, { size: 11, color: "ink-3", align: "right" });
+    g.text("39", x0 - 10, top + 40 * rh + rh * 1.6, { size: 11, color: "ink-3", align: "right" });
+    g.dim(x0, x0 + 128 * cw, top - 20, "128 window", { color: "memory", a: s.between(0, 1) + 0.0001 > 0 ? 1 - s.at(1) * 0.6 : 1 });
+    g.dim(x0 + 128 * cw, x1, top - 20, "+6", { color: "ink-3", a: 1 - s.at(1) * 0.6 });
+    const ra = s.at(1);
+    if (ra > 0.01) {
+      const yS = top + 20 * rh, xl = narrow ? 8 : 14;
+      g.line(x0 - 6, yS + rh * 0.8, x1, yS + rh * 0.8, { color: "ink", lw: 2, dash: [6, 4], a: ra });
+      g.text("STORED", xl, top + 10 * rh, { size: 16, font: "display", weight: 800, color: "memory", a: ra });
+      g.text("first 20", xl, top + 10 * rh + 18, { size: 11, color: "ink-3", a: ra });
+      g.text("DROPPED", xl, top + 30 * rh + rh * 1.6, { size: 16, font: "display", weight: 800, color: "ink-3", a: ra });
+      g.text("rebuilt", xl, top + 30 * rh + rh * 1.6 + 18, { size: 11, color: "ink-3", a: ra });
+      g.text("stored only at multiples of 128 tokens · 20 × 134 × 528 B = 1.42 MB per sequence", x0, bot + 34, { size: 13, color: "ink-2", a: ra * (1 - s.at(2)) });
+    }
+    const ja = s.at(2);
+    if (ja > 0.01) {
+      const y = H - 140;
+      g.box(30, y, (W - 80) / 3, 90, { color: "ok", title: "blocks: OK", sub: "enough free pages", tsize: 18, ssize: 12, a: ja });
+      g.box(40 + (W - 80) / 3, y, (W - 80) / 3, 90, { color: "bad", title: "slot: none", sub: "all state slots taken", tsize: 18, ssize: 12, a: ja });
+      g.box(50 + 2 * (W - 80) / 3, y, (W - 80) / 3, 90, { color: "cpu", title: "→ LATER", sub: "stay in waiting", tsize: 18, ssize: 12, a: ja });
+    }
+  }, { anim: true, restT: 2 });
+
+  /* ---------------- fragmentation lab ---------------- */
+  Atlas.scene("frag", (g, s) => {
+    const st = s.state; if (st.mem === undefined) return;
+    const maxlen = 1024 * Math.pow(2, st.maxlen);
+    const mean = Math.min(st.mean * 1024, maxlen);
+    const kvt = st.kvt * 1024, mem = st.mem * 1e9;
+    const nCon = Math.floor(mem / (maxlen * kvt));
+    const per = Math.ceil(mean / 128) * 128;
+    const nPag = Math.floor(mem / (per * kvt));
+    document.getElementById("f-con").textContent = nCon.toLocaleString();
+    document.getElementById("f-pag").textContent = nPag.toLocaleString();
+    const { W, H } = g;
+    const x0 = 30, x1 = W - 30, bh = Math.min(120, (H - 200) / 2);
+    const draw = (y, n, slot, used, color, title) => {
+      g.text(title, x0, y - 14, { size: 18, font: "display", weight: 800, color });
+      g.rect(x0, y, x1 - x0, bh, { fill: "grid", stroke: "hair", r: 8 });
+      const unit = (x1 - x0) * (slot * kvt) / mem;
+      const show = Math.min(n, 400);
+      for (let k = 0; k < show; k++) {
+        const x = x0 + k * unit;
+        if (x > x1) break;
+        g.rect(x + 0.5, y + 4, Math.max(0.5, unit * used - 1), bh - 8, { fill: color, r: 2, a: 0.85 });
+        if (used < 0.98 && unit > 6) g.hatch(x + unit * used, y + 4, unit * (1 - used) - 1, bh - 8, { color: "bad", a: 0.5, step: 6 });
+      }
+      g.text(`${n.toLocaleString()} requests · ${(100 * used).toFixed(0)}% of each reservation used`, x0, y + bh + 22, { size: 14, color: "ink-2", weight: 600 });
+    };
+    draw(70, nCon, maxlen, mean / maxlen, "bad", "CONTIGUOUS");
+    draw(70 + bh + 90, nPag, per, mean / per, "ok", "PAGED · 128-TOKEN BLOCKS");
+    const gain = nCon > 0 ? (nPag / nCon) : Infinity;
+    g.text(nCon > 0 ? `${gain.toFixed(1)}× more requests fit` : "contiguous can't fit even one request", x0, H - 30, { size: 18, color: "ink", weight: 600 });
+  }, { controls: "frag-ctl", format: (id, v) => id === "maxlen" ? Math.pow(2, v) + "K" : id === "mean" ? v + "K" : id === "kvt" ? v + " KB" : String(v) });
+})();
+
+</script>
+<script>AtlasAlts.render("alts-memory", "sources-memory", "memory");</script>
+</body>
+</html>

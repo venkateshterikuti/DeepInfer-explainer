@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Scheduling a step · DeepInfer Annotated</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&display=swap">
+<link rel="stylesheet" href="atlas.css">
+</head>
+<body>
+<header class="bar">
+  <div class="wrap">
+    <a class="brand" href="index.html"><b>DeepInfer</b><span>annotated</span></a>
+    <nav aria-label="Chapters">
+      <a class="num" href="loop.html" title="The generation loop">01</a>
+      <a class="num" href="model.html" title="The model it serves">02</a>
+      <a class="num" href="engine.html" title="Anatomy of the engine">03</a>
+      <a class="num" href="memory.html" title="KV memory">04</a>
+      <a class="num" href="scheduling.html" aria-current="page" title="Scheduling a step">05</a>
+      <a class="num" href="parallelism.html" title="One model, many GPUs">06</a>
+      <a class="num" href="cluster.html" title="The cluster around it">07</a>
+      <a class="num" href="replay.html" title="Bounded replay">08</a>
+      <a class="num" href="speculation.html" title="Speculative decoding">09</a>
+      <a class="num" href="kernels.html" title="Numbers and kernels">10</a>
+      <a class="num" href="sampling.html" title="Sampling, structure, determinism">11</a>
+      <a class="num" href="frontdoor.html" title="The front door">12</a>
+      <a class="num" href="measure.html" title="Measuring it">13</a>
+      <a href="index.html">Map</a>
+    </nav>
+  </div>
+  <div class="progress"></div>
+</header>
+<main>
+  <section class="hero">
+    <div class="wrap">
+      <div>
+        <span class="eyebrow"><span class="n">05</span> Time</span>
+        <h1>Scheduling <em>a step</em></h1>
+        <p class="dek">Every step answers three questions: prefill or decode, which sequences, and how many tokens of each. Then the CPU has to get out of the GPU's way.</p>
+        <div class="files">
+          <span class="tag">csrc/engine/scheduler.hpp</span>
+          <span class="tag">csrc/engine/zos.cpp</span>
+          <span class="tag">worker/worker.py</span>
+          <span class="tag">worker/cuda_graph_runner.py</span>
+        </div>
+      </div>
+      <div class="board stage-card" data-stage="trace" data-label="A live profiler-style trace: the CPU lane schedules step N+1 and post-processes step N−1 while the GPU lane runs step N without gaps.">
+        <span class="ruler">trace · cpu over gpu</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="prefill">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Prefill</span>
+        <h2>How big a bite of the prompt?</h2>
+        <p class="lede">A 128K-token prompt can't go through in one step without freezing everyone else, and tiny chunks waste the GPU. The scheduler cuts it.</p>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">Chunked prefill</span><h4>One prompt, several steps</h4><p>A long prompt is processed in chunks across consecutive steps. While it is mid-prompt, its status stays <code>WAITING</code>; only the step that schedules its last chunk moves it to <code>RUNNING</code>. Some boundaries are forced: a sequence can carry <code>chunk_checkpoints</code> where a chunk must end.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">In the release</span><h4>A token budget per step</h4><p>The open-source scheduler fills a per-step budget (<code>max_num_batched_tokens</code>, 32,768 in the examples). The chunk is whatever fits in what's left, rounded down to a multiple of the context-parallel alignment so every CP rank gets equal work.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">In production</span><h4>A time budget and a cost model</h4><p>Tokens aren't equal: a chunk deep into a long prompt attends to more history. Production gives each step a time budget and predicts its time with a fitted quadratic <code>cost(q, c)</code>, where <i>q</i> is new tokens and <i>c</i> the prefix already computed. It solves for the largest <i>q</i> that fits, capped at 32,768. Watch the chunk shrink as <i>c</i> grows.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">The group agrees</span><h4>MIN across ranks, and a vote</h4><p>All data-parallel ranks in an expert-parallel group meet at every MoE layer, so they must take the same kind of step and finish together. The time budget is reduced with an all-reduce MIN; engines that run both phases also vote on prefill versus decode.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Multimodal</span><h4>Never cut an image in half</h4><p>An image is one marker token plus N padding tokens. <code>_adjust_chunk_size</code> moves a chunk boundary that lands inside an image either back to the image's start or forward past its last pad, so each image is encoded and attended to in one piece.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="chunk" data-label="A long prompt bar cut into chunks; a token-budget chunk; a cost curve against a time budget with the solved chunk size shrinking as the cached prefix grows; data-parallel ranks reduced to a shared budget; a chunk boundary moved to an image's start."><span class="ruler">prefill · one prompt</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="lab">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Try it</span>
+        <h2>Solve the chunk</h2>
+        <p class="lede">Set the time budget and the prompt. The solver picks each chunk from the cost model; deeper chunks get smaller because attention to the prefix costs more.</p>
+      </header>
+      <div class="lab">
+        <div class="controls" id="chunk-ctl">
+          <div class="ctl"><label for="budget">Time budget per step (ms) <output for="budget">380</output></label><input type="range" id="budget" min="60" max="900" step="10" value="380"></div>
+          <div class="ctl"><label for="plen">Prompt length (tokens) <output for="plen">512K</output></label><input type="range" id="plen" min="4" max="10" step="1" value="9"></div>
+          <div class="ctl"><label for="cached">Already cached from storage <output for="cached">0%</output></label><input type="range" id="cached" min="0" max="90" step="5" value="0"></div>
+          <div class="readout">
+            <div><b id="c-first">–</b><span>first chunk (tokens)</span></div>
+            <div><b id="c-steps">–</b><span>prefill steps</span></div>
+          </div>
+          <p class="note">cost(q, c) = 3 + 0.0105·q + 1.6×10⁻⁸·(q²/2 + q·c) ms, an illustrative fit, not DeepSeek's coefficients. The cap is the real one: 32,768 tokens per step.</p>
+        </div>
+        <div class="board" data-stage="solver" data-label="Prompt bar split into the solved chunks, shrinking toward the end, and the cost curve for the current chunk crossing the time budget."><span class="ruler">chunk solver</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="decode">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Decode</span>
+        <h2>Everyone runs, until memory says no</h2>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">The batch</span><h4>Every running sequence takes a step</h4><p>In a decode step all running sequences go together, up to <code>max_num_seqs</code>. Sequences that just finished prefill (or arrived from a prefill engine) move from the <code>prompted</code> queue into <code>running</code> first.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Room to grow</span><h4>Each crossing of 128 needs a block</h4><p>A sequence whose next tokens cross a 128-token boundary needs a fresh block. The scheduler walks the running list and appends slots; if the free list runs dry, it preempts sequences from the other end of the list until the rest fit.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Lengths</span><h4>One token, or one plus drafts</h4><p>With speculation on, each sequence's step length is 1 + however many drafts it verifies. The speculative scheduler picks those numbers to maximize expected tokens per second (chapter 09).</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="dec" data-label="A decode batch: sequences as rows with growing lengths; rows crossing a 128-token boundary request a block; preempted rows drop out; each row's step length shown as 1 plus verified drafts."><span class="ruler">decode · one step</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="zos">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Zero-overhead scheduling</span>
+        <h2>The CPU works one step ahead</h2>
+        <p class="lede">On by default. The trick is to plan step N+1 before step N has produced its tokens, then fix the plan on the GPU.</p>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">The gap</span><h4>The naive loop idles the GPU</h4><p>schedule(N) → forward(N) → sample(N) → sync → post-process(N) → schedule(N+1). The CPU needs the sampled tokens before it can plan the next step, so the GPU waits through post-processing and scheduling.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">The overlap</span><h4>Plan while the GPU computes</h4><p>While the GPU runs forward(N) and sample(N), the CPU runs schedule(N+1), launches forward(N+1), post-processes N−1 and launches sample(N+1). The GPU queue never empties.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">The fix-up</span><h4>Optimistic plans, corrected on the GPU</h4><p>The CPU plans step N+1 assuming step N's tokens land, advancing each sequence's counters optimistically. On the GPU, small kernels remap the batch, correct each sequence's key length by how many drafts step N actually accepted, and gather step N's sampled tokens as step N+1's inputs. No round trip through the CPU.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">CUDA graphs</span><h4>One launch per decode forward</h4><p>Decode forwards are captured as CUDA graphs for a ladder of batch sizes: powers of two, then fixed steps. A step pads up to the nearest captured size (padding rows point at slot 0) and replays the graph in a single launch.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="overlap" data-label="CPU and GPU lanes: first a naive loop with hatched idle gaps on the GPU, then overlapped work with no gaps, then the GPU-side correction kernels, then the CUDA graph size ladder."><span class="ruler">cpu · gpu lanes</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="code">
+    <div class="wrap stack">
+      <header>
+        <span class="eyebrow">In the repo</span>
+        <h2>The correction step</h2>
+      </header>
+      <div class="split">
+        <div class="code">
+          <div class="hd"><span>worker.py · _correct_seqlens_qk (abridged)</span><a href="https://github.com/deepseek-ai/DeepInfer/blob/main/deepinfer/worker/worker.py" target="_blank" rel="noopener">source</a></div>
+<pre><span class="c">"""CPU-side seqlens_q/k lag one step under ZOS: when this</span>
+<span class="c">batch overlaps the previous one, fix them on the GPU from</span>
+<span class="c">the previous step's sampling results."""</span>
+remap_cpu, seqlens_q_cpu, seqlens_k_cpu, has_overlap = prepare_zos_inputs(
+    seq_metadata_list, prev.seq_metadata_list, n_seq_with_padding, self.nextn)
+<span class="k">if</span> envs.DEEPINFER_ENABLE_MTP_VARLEN:
+    compute_seqlens_q_by_confidence_rates(
+        total_q, remap[:n_seq], prev.sampler_output.confidence_rates_gpu,
+        seqlens_q[:n_seq])
+<span class="k">if</span> self.nextn &gt; <span class="n">0</span>:
+    compute_seqlens_k_zos(seqlens_k[:n_seq], seqlens_q[:n_seq], remap[:n_seq],
+        prev.sampler_output.num_accepted_tokens_gpu, nextn=self.nextn)</pre>
+        </div>
+        <div class="prose">
+          <p><code>prepare_zos_inputs</code> (C++) works out which sequences in step N+1 were also in step N and builds a <code>remap</code> from new batch slots to old ones.</p>
+          <p>If speculation lengths are variable, <code>compute_seqlens_q_by_confidence_rates</code> recomputes each sequence's verify length on the GPU from step N's confidence head outputs, which the CPU hasn't seen yet. Then <code>compute_seqlens_k_zos</code> fixes the key lengths from the real number of accepted drafts.</p>
+          <p>The cost of being one step ahead: a sequence that finished in step N is still in step N+1's plan. Its output is simply discarded. A sequence preempted while its step was in flight is skipped in bookkeeping so it isn't counted twice.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="others">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Other ways to do it</span>
+        <h2>Budgets, votes, and overlap elsewhere</h2>
+      </header>
+      <div class="compare" id="alts-scheduling"></div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap"><div class="sources" id="sources-scheduling"></div></div>
+  </section>
+
+</main>
+<nav class="next" aria-label="Chapter navigation">
+  <div class="wrap">
+    <a href="memory.html"><span>← Chapter 04</span><b>KV memory</b></a>
+    <a class="fwd" href="parallelism.html"><span>Chapter 06 →</span><b>One model, many GPUs</b></a>
+  </div>
+</nav>
+<script src="atlas.js"></script>
+<script src="alts.js"></script>
+<script>
+(function () {
+  const { ramp, ease, clamp, lerp, rng } = Atlas;
+  const cost = (q, c) => 3 + 0.0105 * q + 1.6e-8 * (q * q / 2 + q * c);
+  function solveQ(budget, c) {
+    const a = 0.8e-8, B = 0.0105 + 1.6e-8 * c, C0 = 3 - budget;
+    if (C0 >= 0) return 0;
+    const q = (-B + Math.sqrt(B * B - 4 * a * C0)) / (2 * a);
+    return Math.min(32768, Math.floor(q));
+  }
+  function chunksFor(budget, P, start) {
+    const out = []; let c = start, guard = 0;
+    while (c < P && guard++ < 2000) { const q = Math.min(solveQ(budget, c), P - c); if (q <= 0) break; out.push([c, q]); c += q; }
+    return out;
+  }
+
+  /* ---------------- hero: live trace ---------------- */
+  Atlas.scene("trace", (g, s) => {
+    const { W, H } = g;
+    const x0 = 110, x1 = W - 30, sc = 52, off = (s.t * 60) % (sc * 2.2);
+    const lanes = [["CPU", "cpu", H * 0.32], ["GPU", "compute", H * 0.6]];
+    lanes.forEach(([n, c, y]) => { g.text(n, 40, y + 26, { size: 18, font: "display", weight: 800, color: c }); g.rect(x0, y, x1 - x0, 40, { fill: "grid", r: 4 }); });
+    g.ctx.save(); g.ctx.beginPath(); g.ctx.rect(x0, 0, x1 - x0, H); g.ctx.clip();
+    for (let k = -2; k < 14; k++) {
+      const base = x0 + k * sc * 2.2 - off;
+      const n = k + Math.floor((s.t * 60) / (sc * 2.2));
+      g.rect(base, lanes[1][2] + 3, sc * 1.6 - 3, 34, { fill: "compute", r: 4, a: 0.85 });
+      g.text("fwd " + n, base + 8, lanes[1][2] + 25, { size: 12, color: "sheet", weight: 600 });
+      g.rect(base + sc * 1.6, lanes[1][2] + 3, sc * 0.6 - 3, 34, { fill: "ok", r: 4, a: 0.85 });
+      g.rect(base + 4, lanes[0][2] + 3, sc * 0.55, 34, { fill: "cpu", r: 4, a: 0.85 });
+      g.text("s" + (n + 1), base + 10, lanes[0][2] + 25, { size: 11, color: "sheet", weight: 600 });
+      g.rect(base + sc * 0.65, lanes[0][2] + 3, sc * 0.35, 34, { fill: "cpu", r: 4, a: 0.55 });
+      g.rect(base + sc * 1.05, lanes[0][2] + 3, sc * 0.5, 34, { fill: "cpu", r: 4, a: 0.35 });
+      g.text("p" + (n - 1), base + sc * 1.05 + 6, lanes[0][2] + 25, { size: 11, color: "ink", weight: 600 });
+    }
+    g.ctx.restore();
+    g.text("s = schedule next · p = post-process previous · green = sample", x0, H * 0.6 + 76, { size: 13, color: "ink-3" });
+    g.text("GPU idle time: 0", x1, H * 0.32 - 16, { size: 14, color: "ok", align: "right", weight: 600 });
+  }, { anim: true, restT: 1, zoom: 1.0, minW: 560 });
+
+  /* ---------------- prefill chunking story ---------------- */
+  Atlas.scene("chunk", (g, s) => {
+    const { W, H, narrow } = g;
+    const b = s.b;
+    const x0 = 30, x1 = W - 30, by = 80, bh = 46;
+    const P = 131072;
+    const sx = (v) => x0 + (x1 - x0) * v / P;
+    g.text("one 128K-token prompt", x0, by - 14, { size: 14, color: "ink-3" });
+    g.rect(x0, by, x1 - x0, bh, { fill: "grid", stroke: "hair", r: 6 });
+    // chunk sets by beat
+    let chunks;
+    if (b < 1.5) chunks = Array.from({ length: 4 }, (_, i) => [i * 32768, 32768]);
+    else chunks = chunksFor(380, P, 0);
+    const tA = s.at(2);
+    const cp = (b < 0.9) ? ramp((s.t % 6), 0, 4) : 1;
+    chunks.forEach(([c, q], i) => {
+      const done = b < 0.9 ? (i / chunks.length < cp ? 1 : 0.25) : 1;
+      g.rect(sx(c) + 1, by + 3, sx(c + q) - sx(c) - 2, bh - 6, { fill: i % 2 ? "compute" : "net", r: 4, a: 0.75 * done });
+      if (sx(c + q) - sx(c) > 60) g.text((q / 1024).toFixed(1) + "K", (sx(c) + sx(c + q)) / 2, by + bh / 2 + 5, { size: 12, color: "sheet", align: "center", weight: 600, a: done });
+    });
+    // beat 0 checkpoint
+    const a0 = s.solo(0);
+    if (a0 > 0.01) {
+      g.line(sx(57000), by - 12, sx(57000), by + bh + 12, { color: "memory", lw: 2.5, a: a0 });
+      g.text("chunk_checkpoint", sx(57000) + 6, by + bh + 26, { size: 13, color: "memory", a: a0 });
+      g.text("status stays WAITING until the last chunk is scheduled", x0, by + bh + 56, { size: 14, color: "ink-2", a: a0 });
+    }
+    // beat 1 token budget
+    const a1 = s.solo(1);
+    if (a1 > 0.01) {
+      g.dim(sx(0), sx(32768), by + bh + 20, "max_num_batched_tokens = 32,768", { color: "compute", a: a1, size: 13 });
+      const cy = by + bh + 80;
+      g.text("chunk = min(remaining, budget − tokens already in this step), rounded down to the CP alignment", x0, cy, { size: 14, color: "ink-2", a: a1 });
+      for (let k = 0; k < 8; k++) g.rect(x0 + k * 48, cy + 24, 42, 30, { fill: "compute", r: 4, a: a1 * 0.6 });
+      g.text("CP ranks · equal shares", x0 + 8 * 48 + 10, cy + 45, { size: 13, color: "ink-3", a: a1 });
+    }
+    // beat 2: cost curve with moving c
+    const a2 = s.solo(2);
+    if (a2 > 0.01) {
+      const gx0 = narrow ? 70 : 100, gx1 = narrow ? W - 40 : W * 0.62, gy0 = by + bh + 70, gy1 = H - 80;
+      const qmax = 40000, tmax = 900;
+      const csweep = ((s.t * 0.12) % 1) * 600000;
+      const qx = (q) => gx0 + (gx1 - gx0) * q / qmax, ty = (t) => gy1 - (gy1 - gy0) * t / tmax;
+      g.line(gx0, gy1, gx1, gy1, { color: "ink-3", a: a2 }); g.line(gx0, gy0, gx0, gy1, { color: "ink-3", a: a2 });
+      g.text("new tokens q", (gx0 + gx1) / 2, gy1 + 30, { size: 13, color: "ink-2", align: "center", a: a2 });
+      g.text("step ms", gx0 - 10, gy0 - 8, { size: 13, color: "ink-2", a: a2 });
+      [0, 200000, 400000].forEach((c, k) => {
+        const pts = []; for (let q = 0; q <= qmax; q += 1000) pts.push([qx(q), ty(Math.min(tmax, cost(q, c)))]);
+        g.poly(pts, { color: "compute", lw: 1.4, a: a2 * 0.35 });
+        g.text(`c=${c / 1000}K`, qx(qmax) - 4, ty(Math.min(tmax, cost(qmax, c))) - 6, { size: 11, color: "ink-3", align: "right", a: a2 });
+      });
+      const pts = []; for (let q = 0; q <= qmax; q += 500) pts.push([qx(q), ty(Math.min(tmax, cost(q, csweep)))]);
+      g.poly(pts, { color: "compute", lw: 3, a: a2 });
+      g.line(gx0, ty(380), gx1, ty(380), { color: "cpu", lw: 2, dash: [8, 6], a: a2 });
+      g.text("time budget 380 ms", gx0 + 6, ty(380) - 8, { size: 13, color: "cpu", a: a2 });
+      g.line(qx(32768), gy0, qx(32768), gy1, { color: "bad", lw: 1.5, dash: [3, 5], a: a2 });
+      g.text("cap 32,768", qx(32768) + 4, gy0 + 12, { size: 12, color: "bad", a: a2 });
+      const qs = solveQ(380, csweep);
+      g.circle(qx(qs), ty(cost(qs, csweep)), 8, { fill: "ok", stroke: "sheet", lw: 2, a: a2 });
+      g.text(`c = ${(csweep / 1024).toFixed(0)}K → q* = ${qs.toLocaleString()}`, narrow ? gx0 : gx1 + 24, narrow ? gy0 - 26 : (gy0 + gy1) / 2, { size: 16, color: "ok", weight: 600, a: a2 });
+      if (!narrow) g.text("deeper in the prompt,", gx1 + 24, (gy0 + gy1) / 2 + 26, { size: 13, color: "ink-2", a: a2 });
+      if (!narrow) g.text("the same budget buys fewer tokens", gx1 + 24, (gy0 + gy1) / 2 + 44, { size: 13, color: "ink-2", a: a2 });
+    }
+    // beat 3: DP min
+    const a3 = s.solo(3);
+    if (a3 > 0.01) {
+      const y0 = by + bh + 60, rows = 4, u = ease(((s.t % 4) - 1) / 1.2);
+      const budgets = [0.82, 0.63, 0.94, 0.71];
+      budgets.forEach((v, i) => {
+        const y = y0 + i * 56, w = (x1 - x0 - 120) * lerp(v, 0.63, u);
+        g.text("rank " + i, x0, y + 24, { size: 14, color: "ink-2", a: a3 });
+        g.rect(x0 + 80, y + 4, x1 - x0 - 120, 30, { fill: "grid", r: 6, a: a3 });
+        g.rect(x0 + 80, y + 4, w, 30, { fill: "cpu", r: 6, a: a3 * 0.8 });
+      });
+      g.chip(x0 + 80, y0 + rows * 56 + 24, "all-reduce MIN → one budget for the group", "cpu", { a: a3, size: 14 });
+      g.chip(x0 + 80, y0 + rows * 56 + 64, "ALL / ANY vote: prefill or decode", "net", { a: a3, size: 14 });
+    }
+    // beat 4: image boundary
+    const a4 = s.at(4);
+    if (a4 > 0.01) {
+      const y0 = by + bh + 70, w = x1 - x0;
+      const tok = 40, tw_ = w / tok;
+      const imgStart = 18, imgEnd = 30;
+      const u = ease(((s.t % 4) - 1.2) / 0.8);
+      const cut = lerp(24, imgStart, u);
+      for (let i = 0; i < tok; i++) {
+        const isImg = i >= imgStart && i < imgEnd;
+        g.rect(x0 + i * tw_ + 1, y0, tw_ - 2, 40, { fill: isImg ? "cpu" : "grid", r: 3, a: a4 * (i < cut ? 1 : 0.55) });
+      }
+      g.text("IMG", x0 + (imgStart + 0.5) * tw_, y0 + 25, { size: 11, color: "sheet", weight: 700, align: "center", a: a4 });
+      g.line(x0 + cut * tw_, y0 - 16, x0 + cut * tw_, y0 + 56, { color: "bad", lw: 3, a: a4 });
+      g.text(u < 0.5 ? "budget ends inside the image" : "boundary moved to the image's start", x0 + cut * tw_ + 8, y0 + 76, { size: 14, color: u < 0.5 ? "bad" : "ok", weight: 600, a: a4 });
+      g.text("image = 1 marker token + N pad tokens", x0, y0 + 120, { size: 13, color: "ink-3", a: a4 });
+    }
+  }, { anim: true, restT: 2.5 });
+
+  /* ---------------- solver lab ---------------- */
+  Atlas.scene("solver", (g, s) => {
+    const st = s.state; if (st.budget === undefined) return;
+    const P = 1024 * Math.pow(2, st.plen);
+    const start = Math.floor(P * st.cached / 100 / 128) * 128;
+    const ch = chunksFor(st.budget, P, start);
+    document.getElementById("c-first").textContent = ch.length ? ch[0][1].toLocaleString() : "0";
+    document.getElementById("c-steps").textContent = ch.length ? String(ch.length) : "budget too small";
+    const { W, H } = g;
+    const x0 = 30, x1 = W - 30, by = 70, bh = 50;
+    const sx = (v) => x0 + (x1 - x0) * v / P;
+    g.text("prompt: " + (P / 1024) + "K tokens", x0, by - 14, { size: 14, color: "ink-2", weight: 600 });
+    g.rect(x0, by, x1 - x0, bh, { fill: "grid", stroke: "hair", r: 6 });
+    if (start > 0) { g.rect(x0, by, sx(start) - x0, bh, { fill: "ok", r: 6, a: 0.7 }); g.text("cached", x0 + 8, by + bh / 2 + 5, { size: 13, color: "sheet", weight: 600 }); }
+    ch.forEach(([c, q], i) => g.rect(sx(c) + 0.5, by + 4, Math.max(1, sx(c + q) - sx(c) - 1), bh - 8, { fill: i % 2 ? "compute" : "net", r: 3, a: 0.8 }));
+    const total = ch.reduce((acc, [c, q]) => acc + cost(q, c), 0);
+    g.text(`${ch.length} steps · ~${(total / 1000).toFixed(1)} s of prefill on this rank`, x0, by + bh + 26, { size: 14, color: "ink", weight: 600 });
+    if (ch.length) g.text(`first chunk ${ch[0][1].toLocaleString()} · last full chunk ${ch[Math.max(0, ch.length - 2)][1].toLocaleString()}`, x0, by + bh + 48, { size: 13, color: "ink-3" });
+    // chunk size vs position chart
+    const gx0 = 80, gx1 = W - 40, gy0 = by + bh + 90, gy1 = H - 60;
+    g.chart({ x0: gx0, y0: gy0, x1: gx1, y1: gy1, xmax: P / 1024, ymax: 34000, xticks: [0, P / 4096, P / 2048, (3 * P) / 4096, P / 1024].map(Math.round), yticks: [0, 16384, 32768], fy: (v) => (v / 1024) + "K", fx: (v) => v + "K",
+      xlabel: "position in the prompt (tokens)", ylabel: "chunk size", series: [{ pts: ch.map(([c, q]) => [c / 1024, q]), color: "compute", dots: ch.length < 40 }], tsize: 13, ylabelOff: 50 });
+  }, { controls: "chunk-ctl", format: (id, v) => id === "plen" ? (Math.pow(2, v) >= 1024 ? Math.pow(2, v) / 1024 + "M" : Math.pow(2, v) + "K") : id === "cached" ? v + "%" : String(v) });
+
+  /* ---------------- decode batch ---------------- */
+  Atlas.scene("dec", (g, s) => {
+    const { W, H } = g;
+    const x0 = 90, x1 = W - 40, n = 12, top = 70, rh = Math.min(40, (H - 170) / n);
+    const lens = [3.6, 2.2, 5.9, 1.4, 4.97, 3.0, 6.95, 2.5, 3.98, 1.9, 5.2, 4.4]; // in units of 128 tokens
+    const maxU = 7.5, sx = (u) => x0 + (x1 - x0) * u / maxU;
+    for (let k = 1; k < maxU; k++) { g.line(sx(k), top - 10, sx(k), top + n * rh, { color: "hair", dash: [3, 4] }); g.text(String(k * 128), sx(k), top - 16, { size: 11, color: "ink-3", align: "center" }); }
+    const pre = s.at(1), spec = s.at(2);
+    const R = rng(4);
+    lens.forEach((L, i) => {
+      const y = top + i * rh;
+      const grow = L + 0.06 * ((s.t * 2) % 1);
+      const crosses = Math.floor(L + 0.06) > Math.floor(L);
+      const victim = pre > 0.5 && (i === 6 || i === 2);
+      g.text("seq " + i, x0 - 12, y + rh * 0.65, { size: 12, color: "ink-3", align: "right" });
+      g.rect(x0, y + 4, sx(grow) - x0, rh - 8, { fill: victim ? "bad" : "memory", r: 4, a: victim ? 0.35 : 0.75 });
+      if (crosses && !victim) g.chip(sx(L) + 8, y + rh / 2, "+1 block", "ok", { size: 11, a: s.at(1) });
+      if (victim) g.text("preempted → waiting", sx(grow) + 8, y + rh * 0.65, { size: 12, color: "bad", weight: 600, a: pre });
+      if (spec > 0.01 && !victim) { const k = 1 + Math.floor(R() * 5); g.text(`q = 1+${k - 1}`, x1, y + rh * 0.65, { size: 12, color: "cpu", align: "right", weight: 600, a: spec }); }
+    });
+    g.text("tokens generated so far (dashed lines = 128-token block boundaries)", x0, H - 40, { size: 13, color: "ink-3" });
+  }, { anim: true, restT: 1 });
+
+  /* ---------------- overlap / ZOS ---------------- */
+  function blocks(g, y, list, x0, sc, cur, h) {
+    list.forEach(([st, ln, kind, lab]) => {
+      if (st >= cur) return;
+      const vis = Math.min(ln, cur - st), x = x0 + st * sc;
+      if (kind === "idle") { g.hatch(x, y, vis * sc, h, { color: "bad" }); if (vis >= ln * 0.8) g.text("idle", x + ln * sc / 2, y + h / 2 + 5, { size: 12, color: "bad", align: "center", weight: 600 }); return; }
+      const c = kind === "cpu" ? "cpu" : kind === "fix" ? "ok" : "compute";
+      g.rect(x, y, vis * sc - 3, h, { fill: c, r: 5, a: 0.85 });
+      if (vis >= ln * 0.85 && lab) g.text(lab, x + ln * sc / 2, y + h / 2 + 5, { size: 12, color: "sheet", align: "center", weight: 600 });
+    });
+  }
+  Atlas.scene("overlap", (g, s) => {
+    const { W, H, narrow } = g;
+    const x0 = narrow ? 60 : 90, x1 = W - 30, h = 40;
+    const cur = 12 * clamp(((s.t % 7) / 5));
+    const sc = (x1 - x0) / 12;
+    const a0 = s.swapOut(1);
+    const yC = 110, yG = 170;
+    const lane = (y, n, c, a) => { g.text(n, 20, y + 26, { size: 16, font: "display", weight: 800, color: c, a }); };
+    if (a0 > 0.01) {
+      g.ctx.save(); g.ctx.globalAlpha = a0;
+      lane(yC, "CPU", "cpu", 1); lane(yG, "GPU", "compute", 1);
+      g.text("NAIVE", x0, 80, { size: 20, font: "display", weight: 800, color: "bad" });
+      const cpu = [], gpu = []; let t = 0;
+      for (let n = 0; n < 3; n++) { cpu.push([t, 0.8, "cpu", "sched " + n]); gpu.push([t, 0.8, "idle"]); t += 0.8; gpu.push([t, 2.2, "gpu", "fwd+sample " + n]); t += 2.2; cpu.push([t, 0.8, "cpu", "post " + n]); gpu.push([t, 0.8, "idle"]); t += 0.8; }
+      blocks(g, yC, cpu, x0, sc, cur, h); blocks(g, yG, gpu, x0, sc, cur, h);
+      g.ctx.restore();
+    }
+    const ov = s.swapIn(1);
+    if (ov > 0.01) {
+      const a = ov;
+      g.ctx.save(); g.ctx.globalAlpha = a;
+      lane(yC, "CPU", "cpu", 1); lane(yG, "GPU", "compute", 1);
+      g.text("ZERO-OVERHEAD", x0, 80, { size: 20, font: "display", weight: 800, color: "ok" });
+      const fix = s.at(2);
+      const cpu = [[0, 0.6, "cpu", "s0"]], gpu = [];
+      for (let n = 0; n < 5; n++) {
+        const st = 0.6 + n * 2.2;
+        if (fix > 0.3 && n > 0) { gpu.push([st, 0.35, "fix", ""]); gpu.push([st + 0.35, 1.85, "gpu", "fwd+sample " + n]); }
+        else gpu.push([st, 2.2, "gpu", "fwd+sample " + n]);
+        cpu.push([st + 0.05, 0.65, "cpu", "s" + (n + 1)]); cpu.push([st + 0.75, 0.55, "cpu", "L"]); cpu.push([st + 1.35, 0.65, "cpu", n ? "p" + (n - 1) : "p"]);
+      }
+      blocks(g, yC, cpu, x0, sc, cur, h); blocks(g, yG, gpu, x0, sc, cur, h);
+      g.text("s = schedule next · L = launch · p = post-process previous", x0, yG + 66, { size: 12, color: "ink-3" });
+      g.ctx.restore();
+    }
+    // correction detail
+    const fx = s.solo(2);
+    if (fx > 0.01) {
+      const y = 270;
+      [["remap", "match step N+1 slots to step N"], ["fix k-lengths", "+ drafts actually accepted"], ["gather inputs", "step N's sampled tokens"], ["varlen q", "verify lengths from confidence"]].forEach(([k, v], i) => {
+        const x = 30 + (i % 2) * (W - 60) / 2, yy = y + Math.floor(i / 2) * 76;
+        g.box(x, yy, (W - 80) / 2, 62, { color: "ok", a: fx, title: k, sub: v, tsize: 16, tfont: "mono", tweight: 600, ssize: 12 });
+      });
+      g.text("green slivers on the GPU lane: small TileLang kernels, no CPU round trip", 30, y + 176, { size: 13, color: "ok", a: fx });
+    }
+    const ga = s.at(3);
+    if (ga > 0.01) {
+      const y = 280;
+      g.text("CUDA graphs captured at:", 30, y, { size: 15, color: "ink", weight: 600, a: ga });
+      let x = 30;
+      const sizes = [1, 2, 4, 8, 16, 32, 64, 96, 128, 160, 192, 224, 256];
+      sizes.forEach((sz) => { const sel = sz === 96; const w = g.pill(x, y + 32, String(sz), { size: 13, a: ga, color: sel ? "sheet" : "compute", fill: sel ? "compute" : "sheet", stroke: "compute" }); x += w + 6; if (x > W - 80) x = 30; });
+      g.text("powers of two, then fixed steps (illustrative interval)", 30, y + 74, { size: 13, color: "ink-3", a: ga });
+      g.text("batch of 70 rows → replay graph 96 · 26 padding rows point at slot 0", 30, y + 104, { size: 14, color: "ink", a: ga });
+      g.text("one launch replaces hundreds of kernel launches", 30, y + 130, { size: 14, color: "ok", a: ga, weight: 600 });
+      const ky = y + 170, kw = (W - 120) / 2;
+      g.text("eager: one CPU launch per kernel", 30, ky, { size: 13, color: "ink-2", a: ga });
+      for (let k = 0; k < 60; k++) { g.rect(30 + k * (kw / 60), ky + 12, kw / 60 - 2, 26, { fill: "cpu", r: 1, a: ga * 0.7 }); }
+      g.text("graph replay: one launch", 60 + kw, ky, { size: 13, color: "ink-2", a: ga });
+      g.rect(60 + kw, ky + 12, kw * 0.25, 26, { fill: "ok", r: 4, a: ga * 0.85 });
+    }
+  }, { anim: true, restT: 6 });
+})();
+
+</script>
+<script>AtlasAlts.render("alts-scheduling", "sources-scheduling", "scheduling");</script>
+</body>
+</html>

@@ -1,0 +1,639 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Sampling, structure, determinism · DeepInfer Annotated</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&display=swap">
+<link rel="stylesheet" href="atlas.css">
+</head>
+<body>
+<header class="bar">
+  <div class="wrap">
+    <a class="brand" href="index.html"><b>DeepInfer</b><span>annotated</span></a>
+    <nav aria-label="Chapters">
+      <a class="num" href="loop.html" title="The generation loop">01</a>
+      <a class="num" href="model.html" title="The model it serves">02</a>
+      <a class="num" href="engine.html" title="Anatomy of the engine">03</a>
+      <a class="num" href="memory.html" title="KV memory">04</a>
+      <a class="num" href="scheduling.html" title="Scheduling a step">05</a>
+      <a class="num" href="parallelism.html" title="One model, many GPUs">06</a>
+      <a class="num" href="cluster.html" title="The cluster around it">07</a>
+      <a class="num" href="replay.html" title="Bounded replay">08</a>
+      <a class="num" href="speculation.html" title="Speculative decoding">09</a>
+      <a class="num" href="kernels.html" title="Numbers and kernels">10</a>
+      <a class="num" href="sampling.html" aria-current="page" title="Sampling, structure, determinism">11</a>
+      <a class="num" href="frontdoor.html" title="The front door">12</a>
+      <a class="num" href="measure.html" title="Measuring it">13</a>
+      <a href="index.html">Map</a>
+    </nav>
+  </div>
+  <div class="progress"></div>
+</header>
+<main>
+  <section class="hero">
+    <div class="wrap">
+      <div>
+        <span class="eyebrow"><span class="n">11</span> The last step</span>
+        <h1>Sampling, <em>structure, determinism</em></h1>
+        <p class="dek">After all the attention and experts, a step ends with one row of 129,280 numbers per request. Turning that row into a token is where grammars, speculative checks and reproducibility all live.</p>
+        <div class="files">
+          <span class="tag">layers/sampler.py</span>
+          <span class="tag">tilelang_ops/fused_sample.py</span>
+          <span class="tag">tilelang_ops/random_sampling.py</span>
+          <span class="tag">structure_output/</span>
+        </div>
+      </div>
+      <div class="board stage-card" data-stage="pick" data-label="A long row of vocabulary scores narrows to a shortlist, is reshaped by temperature and cut by top-p, and a hashed random number picks one token.">
+        <span class="ruler">129,280 logits → 1 token</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <div class="facts">
+        <div><b>129,280</b><span>vocabulary entries scored per sampled row</span></div>
+        <div><b>4,096</b><span>shortlist size in the offline example (1,024 in the benchmark; off by default)</span></div>
+        <div><b>64-bit</b><span>per-request seed; each token's random number is a hash of seed and position</span></div>
+        <div><b>3</b><span>grammar kinds: JSON schema, regex, EBNF (via XGrammar)</span></div>
+        <div><b>16 KB</b><span>grammar bitmask per row: one bit per vocabulary entry</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="pipeline">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">The sampler</span>
+        <h2>From a row of scores to one token</h2>
+        <p class="lede">One fused kernel does most of this, on the GPU, for every row in the batch at once.</p>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">Logits</span><h4>Hidden state × embedding table</h4><p>Only the rows that need a token get scored: the last position of each prompt, or every position of a decode step (the real token plus its drafts). Each row's final hidden state (5,120 numbers) is multiplied by the 129,280-row output embedding, giving one score (logit) per vocabulary entry.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Shortlist</span><h4>Work on the top few thousand</h4><p>With <code>DEEPINFER_SAMPLER_FORCE_TOPK</code> set, DeepSelect keeps only the highest-scoring 4,096 (or 1,024) logits per row and remembers their vocabulary ids. Softmax, sampling and verification then run on that short row. Blacklisted tokens are set to −∞ first, and a request can ask that its first token not be end-of-sequence.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Shape</span><h4>Temperature, top-k, top-p</h4><p>Dividing by the temperature sharpens or flattens the distribution; top-k and top-p then drop the tail. A log-softmax gives the logprobs that are returned to the caller (up to 1,000 alternatives per position).</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Draw</span><h4>A random number with no state</h4><p>There is no shared random generator. Each draw hashes the request's 64-bit seed with the token's position (SplitMix64) into a uniform number, then inverts the cumulative distribution. The same request at the same position always gets the same number, whatever else is in the batch.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Verify</span><h4>Drafts go through the same kernel</h4><p>For draft rows, the kernel compares the target's probability with the drafter's and applies the accept/resample rule from chapter 09. It also estimates each draft's true acceptance probability, so the engine can track how well calibrated the confidence head is.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="sampler" data-label="A hidden state multiplied by the embedding table into a long logits row; the row cut to a shortlist with an index map; the shortlist reshaped by temperature and cut by top-p; a hash of seed and position producing a uniform number that lands on the cumulative distribution; target and draft probabilities compared for a draft row."><span class="ruler">one sampled row</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="lab">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Try it</span>
+        <h2>Shape a distribution, roll the dice</h2>
+        <p class="lede">Twenty candidate tokens after <i>"The kernel ran"</i>. Change the knobs and watch which tokens survive and which one the seed picks.</p>
+      </header>
+      <div class="lab">
+        <div class="controls" id="samp-ctl">
+          <div class="ctl"><label for="temp">Temperature <output for="temp">0.80</output></label><input type="range" id="temp" min="0.05" max="2" step="0.05" value="0.8"></div>
+          <div class="ctl"><label for="topp">Top-p <output for="topp">0.90</output></label><input type="range" id="topp" min="0.05" max="1" step="0.01" value="0.9"></div>
+          <div class="ctl"><label for="topk">Top-k <output for="topk">20</output></label><input type="range" id="topk" min="1" max="20" step="1" value="20"></div>
+          <div class="ctl"><label for="seed">Seed <output for="seed">42</output></label><input type="range" id="seed" min="0" max="99" step="1" value="42"></div>
+          <div class="readout">
+            <div><b id="sp-kept">–</b><span>tokens that can be drawn</span></div>
+            <div><b id="sp-tok">–</b><span>token at position 0</span></div>
+          </div>
+          <p class="note">Probabilities are illustrative. The draw uses the same SplitMix64 hash idea as the engine: one uniform number per (seed, position).</p>
+        </div>
+        <div class="board" data-stage="shape" data-label="Twenty candidate tokens as probability bars after temperature; bars removed by top-k or top-p fade out; a cumulative line with the uniform draw marking the chosen token; the next five positions' tokens for the same seed."><span class="ruler">20 candidates · position 0..5</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="grammar">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Structured output</span>
+        <h2>Only tokens the grammar allows</h2>
+        <p class="lede">A JSON schema, regex or EBNF grammar becomes a mask over the vocabulary, recomputed every step on the CPU and applied on the GPU.</p>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">Compile</span><h4>Off the critical path</h4><p>XGrammar compiles the schema on a worker thread while the engine keeps running other requests. The request joins the scheduler only when its matcher is ready, and is aborted if compiling takes over 20 seconds. Compiled grammars are cached, with a byte limit (10 GiB by default) because an unbounded cache can be grown by distinct schemas until memory runs out.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Mask</span><h4>One bit per token</h4><p>Each step, the matcher writes which tokens are legal into a bitmask: 129,280 bits, about 16 KB per row. The CPU fills it while the GPU computes logits; a side stream copies it over, and a TileLang kernel sets every forbidden logit to −∞ before sampling.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">With drafts</span><h4>Masks for every draft position</h4><p>With speculation, the matcher walks forward through the request's draft tokens, filling a mask for each position, then rolls back the same number of steps. Every verified row gets its own mask in one pass. Next step, the matcher advances by the tokens actually emitted.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Triggers</span><h4>Free text, then a grammar</h4><p>A request can pass <code>trigger_token_ids</code>: generation is free until that exact token sequence appears, then the grammar applies, which suits tool calls inside normal text. Partial matches are tracked with a KMP failure table. An optional <code>bound_token_id</code> forces the trigger sequence to follow once it appears.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="gram" data-label="A schema compiling on a worker thread beside the running engine; a bitmask over the vocabulary with allowed tokens lit; a matcher walking forward over three drafts and rolling back; a token stream where free text runs until a trigger sequence appears and the grammar takes over."><span class="ruler">matcher · mask · rollback</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="determinism">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Determinism</span>
+        <h2>Same input, same output</h2>
+        <p class="lede">Two separate guarantees: the model's numbers don't depend on the batch, and the random draws don't either.</p>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">The cause</span><h4>Addition order changes the answer</h4><p>Floating-point addition isn't associative. Kernels pick how to split and reduce a sum based on the batch shape, so the same request can get slightly different logits depending on who it was batched with, and a near-tie between two tokens can flip.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Batch invariance</span><h4>Fix the reduction order</h4><p><code>DEEPINFER_BATCH_INVARIANT=1</code> switches DeepGEMM and TileKernels to deterministic algorithms, runs FlashMLA in its batch-invariant mode and avoids one fused prefill path. A test runs 64 prompts batched and one at a time, with 5 drafts, and requires identical tokens and logprobs. NVIDIA only for now.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Deterministic sampling</span><h4>Seeds, positions, fixed draft length</h4><p>With batch invariance on and a fixed <code>seq_seed</code>, the hashed draws make sampling repeatable. Confidence-scheduled verification must be off (<code>DEEPINFER_ENABLE_MTP_VARLEN=0</code>), because how many drafts a request gets verified depends on the rest of the batch.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="det" data-label="Two reduction trees summing the same four numbers in FP32 giving 1 and 2; logits of one request in two different batches diverging then aligning under batch-invariant mode; a seed and position hashed into the same uniform number regardless of batch order."><span class="ruler">FP32 · reduction order</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="code">
+    <div class="wrap stack">
+      <header>
+        <span class="eyebrow">In the repo</span>
+        <h2>The reference sampler</h2>
+      </header>
+      <div class="split">
+        <div class="code">
+          <div class="hd"><span>tilelang_ops/random_sampling.py · random_sampling_ref</span><a href="https://github.com/deepseek-ai/DeepInfer/blob/main/deepinfer/model_executor/layers/tilelang_ops/random_sampling.py" target="_blank" rel="noopener">source</a></div>
+<pre><span class="c"># hash (seq_seeds, 3 * sample_positions + case) to a uniform</span>
+<span class="c"># and invert the fp64 CDF</span>
+sample_case = <span class="n">1</span> <span class="k">if</span> is_nextn_predict <span class="k">else</span> <span class="n">0</span>
+seq = (sample_positions * <span class="n">3</span> + sample_case) * i64(<span class="n">0x9E3779B97F4A7C15</span>)
+combined = seq_seeds + (seq ^ (seq * (<span class="n">1</span> &lt;&lt; <span class="n">13</span>)))
+u = _hash_to_uniform(combined).unsqueeze(-<span class="n">1</span>)     <span class="c"># SplitMix64</span>
+cdf = probs.double().cumsum(dim=-<span class="n">1</span>)
+target = u * cdf[:, -<span class="n">1</span>:]
+<span class="k">return</span> (cdf &gt; target).long().argmax(dim=-<span class="n">1</span>).int()</pre>
+        </div>
+        <div class="prose">
+          <p>This is the pure-PyTorch version that the TileLang kernel is tested against. Because the random number depends only on the seed, the position and which draw it is (fresh sample, accept test or resample after a rejection; the drafter uses an offset seed), reordering the batch can't change any token. The test suite checks exactly that by permuting rows and sampling them one at a time.</p>
+          <p>Without a seed, each request gets a random 64-bit one, so ordinary sampling stays random across requests.</p>
+          <p>When a grammar matcher hits an internal error, only that request is killed; raising in the sampling path would stall every rank waiting at the next collective.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="others">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Other ways to do it</span>
+        <h2>Grammars and reproducibility elsewhere</h2>
+      </header>
+      <div class="compare" id="alts-sampling"></div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap"><div class="sources" id="sources-sampling"></div></div>
+  </section>
+
+</main>
+<nav class="next" aria-label="Chapter navigation">
+  <div class="wrap">
+    <a href="kernels.html"><span>← Chapter 10</span><b>Numbers and kernels</b></a>
+    <a class="fwd" href="frontdoor.html"><span>Chapter 12 →</span><b>The front door</b></a>
+  </div>
+</nav>
+<script src="atlas.js"></script>
+<script src="alts.js"></script>
+<script>
+(function () {
+  const { ramp, ease, clamp, lerp, rng } = Atlas;
+  // SplitMix64-style hash of (seed, position, case) -> uniform [0,1), as in random_sampling_ref
+  const M64 = (1n << 64n) - 1n;
+  function u01(seed, pos, kase = 0) {
+    let seq = ((BigInt(pos) * 3n + BigInt(kase)) * 0x9E3779B97F4A7C15n) & M64;
+    let z = (BigInt(seed) + (seq ^ ((seq << 13n) & M64))) & M64;
+    z = (z + 0x9E3779B97F4A7C15n) & M64;
+    z = ((z ^ (z >> 30n)) * 0xBF58476D1CE4E5B9n) & M64;
+    z = ((z ^ (z >> 27n)) * 0x94D049BB133111EBn) & M64;
+    z = z ^ (z >> 31n);
+    return Number(z >> 11n) / 9007199254740992;
+  }
+  function softmax(ls, T) { const m = Math.max(...ls); const e = ls.map((l) => Math.exp((l - m) / T)); const s = e.reduce((a, b) => a + b, 0); return e.map((v) => v / s); }
+
+  /* ---------------- hero ---------------- */
+  const HR = rng(4), HL = []; for (let i = 0; i < 150; i++) HL.push(-2 + 3 * Math.pow(HR(), 3) + HR() * 0.6);
+  const HORD = HL.map((l, i) => [l, i]).sort((a, b) => b[0] - a[0]).map((x) => x[1]);
+  const HTOP = HORD.slice(0, 20);
+  const HTOK = [" fast", " in", " out", " for", " on", " twice", " hot", " again", " at", " into", " slowly", ",", ".", " until", " so", " through", " well", " cold", " late", " long"];
+  Atlas.scene("pick", (g, s) => {
+    const { W, H } = g;
+    const cyc = 7, tt = s.t % cyc, round = Math.floor(s.t / cyc);
+    const x0 = 40, x1 = W - 40, base = H - 110;
+    const pA = ease(clamp((tt - 1.0) / 1.0)), pT = ease(clamp((tt - 2.3) / 0.8)), pP = ease(clamp((tt - 3.2) / 0.6)), pD = ease(clamp((tt - 4.0) / 0.9));
+    const T = lerp(1, 0.6, pT);
+    const topL = HTOP.map((i) => HL[i]);
+    const probs = softmax(topL, T);
+    let cum = 0, keepN = 0; for (; keepN < probs.length; keepN++) { cum += probs[keepN]; if (cum >= 0.85) { keepN++; break; } }
+    const kept = probs.slice(0, keepN), ks = kept.reduce((a, b) => a + b, 0);
+    const u = u01(42 + round, 7);
+    let pick = 0, acc = 0; for (; pick < kept.length; pick++) { acc += kept[pick] / ks; if (acc > u) break; }
+    pick = Math.min(pick, kept.length - 1);
+    const fullW = (x1 - x0) / 150, shortW = (x1 - x0) / 20;
+    // full row → shortlist
+    HL.forEach((l, i) => {
+      const r = HTOP.indexOf(i), inTop = r >= 0;
+      const xa = x0 + i * fullW, xb = inTop ? x0 + r * shortW : xa;
+      const x = lerp(xa, xb, inTop ? pA : 0), w = lerp(fullW * 0.7, inTop ? shortW * 0.72 : fullW * 0.7, inTop ? pA : 0);
+      const hLogit = (l + 2.2) * (H - 220) / 6;
+      const hProb = inTop ? probs[r] * (H - 200) * 1.6 : 0;
+      const h = inTop ? lerp(hLogit, hProb, pT) : hLogit;
+      const cut = inTop && r >= keepN ? pP : 0;
+      const col = inTop && r === pick && pD > 0.5 ? "ok" : inTop ? "compute" : "ink-3";
+      const a = inTop ? 0.85 * (1 - 0.75 * cut) : 0.5 * (1 - pA);
+      g.rect(x, base - h, w, h, { fill: col, r: 2, a });
+    });
+    g.line(x0, base, x1, base, { color: "ink-3", lw: 1 });
+    // labels
+    const lab = tt < 1.0 ? "one logit per vocabulary entry (129,280; 150 drawn)" : tt < 2.3 ? "shortlist: keep the top-k, remember their ids" : tt < 3.2 ? `temperature ${T.toFixed(2)} sharpens the distribution` : tt < 4.0 ? "top-p 0.85 drops the tail" : "hash(seed, position) → u, invert the CDF";
+    g.text(lab, x0, H - 14, { size: 13, color: "ink-2" });
+    if (pP > 0.01) {
+      const cx = x0 + keepN * shortW - shortW * 0.14;
+      g.line(cx, base - (H - 230), cx, base + 8, { color: "bad", lw: 2, dash: [5, 4], a: pP });
+      g.text("top-p cut", cx + 6, base - (H - 240), { size: 12, color: "bad", weight: 600, a: pP });
+    }
+    // CDF strip
+    if (pD > 0.01) {
+      const sy = base + 28, sw = (x1 - x0) * 0.6;
+      let xx = x0;
+      kept.forEach((p, i) => { const w = sw * p / ks; g.rect(xx, sy, w - 1, 16, { fill: i === pick ? "ok" : "compute", a: pD * (i === pick ? 0.95 : 0.35 + 0.1 * (i % 2)) }); xx += w; });
+      const ux = x0 + sw * u;
+      g.head(ux, sy - 2, Math.PI / 2, { color: "ink", size: 10, a: pD });
+      g.text(`u = ${u.toFixed(3)}`, ux, sy + 40, { size: 12, color: "ink", align: "center", weight: 600, a: pD });
+      g.pill(x0 + sw + 40, sy + 8, "→ \"" + HTOK[pick].trim() + "\"", { size: 16, color: "ok", stroke: "ok", a: pD });
+    }
+  }, { anim: true, restT: 5.2, zoom: 1.0, minW: 540 });
+
+  /* ---------------- sampler pipeline ---------------- */
+  const SR = rng(9), SL = []; for (let i = 0; i < 120; i++) SL.push(-2 + 3.2 * Math.pow(SR(), 3.2) + SR() * 0.5);
+  const SORD = SL.map((l, i) => [l, i]).sort((a, b) => b[0] - a[0]).map((x) => x[1]);
+  Atlas.scene("sampler", (g, s) => {
+    const { W, H, narrow } = g;
+    const a0 = s.solo(0), a1 = s.solo(1), a2 = s.solo(2), a3 = s.solo(3), a4 = s.solo(4);
+    const x0 = 40, x1 = W - 40;
+    const rowY = H * 0.62, rowH = H * 0.22;
+    const drawRow = (a, hi) => {
+      const bw = (x1 - x0) / SL.length;
+      SL.forEach((l, i) => { const h = (l + 2.1) * rowH / 5.5, top = SORD.indexOf(i) < 24; g.rect(x0 + i * bw, rowY - h, bw * 0.7, h, { fill: hi && top ? "compute" : "ink-3", r: 1, a: a * (hi ? (top ? 0.9 : 0.25) : 0.6) }); });
+      g.line(x0, rowY, x1, rowY, { color: "ink-3", lw: 1, a });
+    };
+    if (a0 > 0.01) {
+      // hidden vector × matrix
+      const hx = x0, hy = 70, cell = 14;
+      for (let k = 0; k < 12; k++) g.rect(hx, hy + k * (cell + 2), cell, cell, { fill: "compute", r: 2, a: a0 * (0.3 + 0.6 * ((k * 37) % 10) / 10) });
+      g.text("hidden", hx, hy + 12 * (cell + 2) + 18, { size: 12, color: "ink-2", a: a0 });
+      g.text("5,120", hx, hy + 12 * (cell + 2) + 34, { size: 12, color: "ink-3", a: a0 });
+      g.text("×", hx + 46, hy + 100, { size: 30, color: "ink-3", a: a0 });
+      const mx = hx + 80, mw = x1 - mx, mh = 12 * (cell + 2);
+      g.rect(mx, hy, mw, mh, { fill: "memory", r: 6, a: a0 * 0.18 }); g.rect(mx, hy, mw, mh, { stroke: "memory", lw: 1.5, r: 6, a: a0 });
+      for (let k = 1; k < 24; k++) g.line(mx + k * mw / 24, hy + 4, mx + k * mw / 24, hy + mh - 4, { color: "memory", lw: 1, a: a0 * 0.18 });
+      g.text("output embedding · 129,280 rows", mx + mw / 2, hy + mh / 2 + 6, { size: 15, color: "memory", align: "center", weight: 600, a: a0 });
+      g.arrow(W / 2, hy + mh + 10, W / 2, rowY - rowH - 16, { color: "ink-3", lw: 1.5, a: a0 });
+      drawRow(a0, false);
+      g.text("logits: one float per token", x0, rowY + 24, { size: 13, color: "ink-2", a: a0 });
+      g.text("rows scored: last prompt position · decode token + its drafts", x0, rowY + 48, { size: 13, color: "ink-3", a: a0 });
+    }
+    if (a1 > 0.01) {
+      const lift = ease(clamp(((s.t % 5) - 0.3) / 1.0));
+      const bw = (x1 - x0) / SL.length, sw = (x1 - x0) / 24, sy = H * 0.34;
+      SL.forEach((l, i) => {
+        const r = SORD.indexOf(i), top = r < 24, h = (l + 2.1) * rowH / 5.5;
+        const black = i === 37 || i === 81;
+        if (black) { g.text("×", x0 + i * bw, rowY + 16, { size: 14, color: "bad", weight: 700, a: a1 }); }
+        const xa = x0 + i * bw, ya = rowY;
+        const xb = x0 + r * sw, yb = sy;
+        const x = top ? lerp(xa, xb, lift) : xa, y = top ? lerp(ya, yb, lift) : ya, w = top ? lerp(bw * 0.7, sw * 0.7, lift) : bw * 0.7;
+        g.rect(x, y - h, w, h, { fill: top ? "compute" : black ? "bad" : "ink-3", r: 1, a: a1 * (top ? 0.9 : black ? 0.6 : 0.25) });
+        if (top && lift > 0.9) g.text(String(1000 + ((i * 7919) % 120000)), xb + sw * 0.35, sy + 16, { size: narrow ? 8 : 9, color: "ink-3", align: "center", a: a1 * ramp(lift, 0.9, 0.1) });
+      });
+      g.line(x0, rowY, x1, rowY, { color: "ink-3", lw: 1, a: a1 });
+      g.line(x0, sy, x1, sy, { color: "compute", lw: 1, a: a1 * lift });
+      g.text("DeepSelect top-k → shortlist of 4,096 (24 drawn)", x0, 54, { size: 14, color: "compute", weight: 600, a: a1 });
+      g.text("token_index: shortlist slot → vocabulary id", x0, sy + 38, { size: 12, color: "ink-3", a: a1 * lift });
+      g.text("× blacklisted ids set to −∞ before anything else", x0, rowY + 44, { size: 12, color: "bad", a: a1 });
+    }
+    if (a2 > 0.01) {
+      const T = 0.95 + 0.5 * Math.sin(s.t * 1.1), topk = 12, topp = 0.9;
+      const ls = SORD.slice(0, 24).map((i) => SL[i]);
+      const ps = softmax(ls, T);
+      let cum = 0, kp = 0; for (; kp < topk; kp++) { cum += ps[kp]; if (cum >= topp) { kp++; break; } }
+      const sw = (x1 - x0) / 24, base = H - 120, hmax = H - 280;
+      ps.forEach((p, r) => {
+        const out = r >= kp, h = Math.min(1, p / 0.32) * hmax;
+        g.rect(x0 + r * sw, base - h, sw * 0.7, h, { fill: out ? "ink-3" : "compute", r: 2, a: a2 * (out ? 0.25 : 0.88) });
+      });
+      g.line(x0, base, x1, base, { color: "ink-3", lw: 1, a: a2 });
+      const cx = x0 + kp * sw - sw * 0.15;
+      g.line(cx, 110, cx, base + 6, { color: "bad", lw: 2, dash: [5, 4], a: a2 });
+      g.text("top-p 0.9", cx + 6, 124, { size: 12, color: "bad", weight: 600, a: a2 });
+      g.line(x0 + topk * sw - sw * 0.15, 140, x0 + topk * sw - sw * 0.15, base + 6, { color: "cpu", lw: 2, dash: [2, 4], a: a2 });
+      g.text("top-k 12", x0 + topk * sw - sw * 0.15 + 6, 154, { size: 12, color: "cpu", weight: 600, a: a2 });
+      g.text(`temperature ${T.toFixed(2)}`, x0, 64, { size: 20, font: "display", weight: 800, color: "ink", a: a2 });
+      g.text("probability = softmax(logit ÷ T), then renormalize what's left", x0, base + 34, { size: 13, color: "ink-2", a: a2 });
+      g.text("log-softmax → returned logprobs (up to 1,000 alternatives)", x0, base + 58, { size: 13, color: "ink-3", a: a2 });
+    }
+    if (a3 > 0.01) {
+      const bx = x0, by = 64;
+      g.pill(bx, by, "seq_seed 0x5DEEC0DE", { size: 14, color: "memory", stroke: "memory", a: a3 });
+      g.pill(bx, by + 46, "position 17", { size: 14, color: "cpu", stroke: "cpu", a: a3 });
+      g.pill(bx, by + 92, "case: target", { size: 14, color: "ink-2", a: a3 });
+      const hx = bx + (narrow ? 220 : 260);
+      g.box(hx, by - 16, 150, 120, { color: "ink-3", title: "SplitMix64", sub: "hash, no state", tsize: 20, ssize: 12, a: a3 });
+      [0, 46, 92].forEach((dy) => g.arrow(bx + (narrow ? 196 : 236), by + dy, hx - 4, by + 44, { color: "ink-3", lw: 1.2, head: 8, a: a3 }));
+      const u = +u01(0x5DEEC0DE, 17).toFixed(3);
+      g.arrow(hx + 154, by + 44, hx + 200, by + 44, { color: "ink", lw: 1.5, a: a3 });
+      g.text(`u = ${u}`, hx + 210, by + 50, { size: 18, color: "ink", weight: 700, a: a3 });
+      // CDF staircase
+      const cx0 = x0 + 40, cx1 = x1 - 10, cy0 = by + 140, cy1 = H - 70;
+      const ps = softmax(SORD.slice(0, 12).map((i) => SL[i]), 0.8);
+      let cum = 0; const pts = [[cx0, cy1]];
+      ps.forEach((p, i) => { const xa = cx0 + (cx1 - cx0) * i / 12, xb = cx0 + (cx1 - cx0) * (i + 1) / 12; pts.push([xa, cy1 - (cy1 - cy0) * cum]); cum += p; pts.push([xa, cy1 - (cy1 - cy0) * cum]); pts.push([xb, cy1 - (cy1 - cy0) * cum]); });
+      g.line(cx0, cy1, cx1, cy1, { color: "ink-3", lw: 1, a: a3 }); g.line(cx0, cy0, cx0, cy1, { color: "ink-3", lw: 1, a: a3 });
+      g.poly(pts, { color: "compute", lw: 2.5, a: a3 });
+      const sweep = ease(clamp(((s.t % 5) - 0.5) / 1.2));
+      const uy = cy1 - (cy1 - cy0) * u;
+      let c2 = 0, pick = 0; for (; pick < 12; pick++) { c2 += ps[pick]; if (c2 > u) break; }
+      const hitX = cx0 + (cx1 - cx0) * (pick + 0.5) / 12;
+      g.line(cx0, uy, lerp(cx0, hitX, sweep), uy, { color: "ink", lw: 1.5, dash: [5, 4], a: a3 });
+      g.text("u", cx0 - 14, uy + 5, { size: 13, color: "ink", weight: 700, align: "right", a: a3 });
+      if (sweep > 0.95) { g.line(hitX, uy, hitX, cy1, { color: "ok", lw: 2, a: a3 }); g.circle(hitX, uy, 6, { fill: "ok", a: a3 }); g.text(`token #${pick + 1} in the shortlist`, hitX + 10, uy - 10, { size: 13, color: "ok", weight: 600, a: a3 }); }
+      g.text("cumulative probability", cx0 + 8, cy0 + 4, { size: 12, color: "ink-3", a: a3 });
+    }
+    if (a4 > 0.01) {
+      const rows = [["token", null], ["d1", true], ["d2", true], ["d3", true], ["d4", false], ["d5", null]];
+      const ry0 = 80, rh = Math.min(64, (H - 190) / 6);
+      rows.forEach(([lab, acc], i) => {
+        const y = ry0 + i * rh;
+        g.text(i === 0 ? "real token" : "draft " + i, x0, y + rh * 0.55, { size: 13, color: "ink-2", a: a4 });
+        const px = x0 + 110, pw = (x1 - px - 150);
+        const p = [0.9, 0.8, 0.62, 0.7, 0.12, 0.5][i], q = [0, 0.75, 0.7, 0.66, 0.6, 0.55][i];
+        g.rect(px, y + 6, pw * p, rh * 0.32, { fill: "compute", r: 3, a: a4 * 0.85 });
+        if (i > 0) g.rect(px, y + 8 + rh * 0.32, pw * q, rh * 0.22, { fill: "cpu", r: 3, a: a4 * 0.6 });
+        const res = acc === true ? ["accept", "ok"] : acc === false ? ["reject → resample", "bad"] : i === 0 ? ["sample", "ink"] : ["not reached", "ink-3"];
+        g.text(res[0], x1, y + rh * 0.55, { size: 13, color: res[1], align: "right", weight: 600, a: a4 });
+      });
+      g.chip(x0 + 110, ry0 - 26, "p target", "compute", { size: 12, a: a4 });
+      g.chip(x0 + 220, ry0 - 26, "q drafter", "cpu", { size: 12, a: a4 });
+      g.text("accept with min(1, p ÷ q) · the kernel also estimates each draft's real acceptance", x0, H - 60, { size: 13, color: "ink-2", a: a4 });
+      g.text("probability, which feeds a running confidence-error metric", x0, H - 38, { size: 13, color: "ink-2", a: a4 });
+    }
+  }, { anim: true, restT: 2.6 });
+
+  /* ---------------- sampling lab ---------------- */
+  const LTOK = [" in", " out", " fast", " for", " on", " twice", " hot", " again", " at", " into", " slowly", ",", ".", " until", " smoothly", " through", " cold", " forever", " late", " backwards"];
+  const LLOG = [3.2, 2.95, 2.7, 2.35, 2.1, 1.75, 1.5, 1.3, 1.1, 0.9, 0.75, 0.6, 0.45, 0.3, 0.1, -0.2, -0.5, -0.9, -1.4, -2.0];
+  function lab(T, topp, topk, seed, pos) {
+    const ps = softmax(LLOG, T);
+    let cum = 0, keep = 0;
+    for (; keep < Math.min(topk, ps.length); keep++) { cum += ps[keep]; if (cum >= topp - 1e-9) { keep++; break; } }
+    keep = Math.min(keep, topk);
+    const ks = ps.slice(0, keep).reduce((a, b) => a + b, 0);
+    const u = u01(seed, pos);
+    let acc = 0, pick = 0; for (; pick < keep; pick++) { acc += ps[pick] / ks; if (acc > u) break; }
+    return { ps, keep, ks, u, pick: Math.min(pick, keep - 1) };
+  }
+  Atlas.scene("shape", (g, s) => {
+    const st = s.state; if (st.temp === undefined) return;
+    const { W, H, narrow } = g;
+    const r = lab(st.temp, st.topp, st.topk, st.seed, 0);
+    document.getElementById("sp-kept").textContent = String(r.keep);
+    document.getElementById("sp-tok").textContent = "“" + LTOK[r.pick].trim() + "”";
+    const x0 = 40, lw = 96, bx = x0 + lw, bw = narrow ? W - bx - 150 : W * 0.55 - bx, rh = (H - 120) / 20;
+    const pmax = Math.max(...r.ps);
+    r.ps.forEach((p, i) => {
+      const y = 30 + i * rh, kept = i < r.keep, chosen = i === r.pick;
+      g.text(LTOK[i].replace(" ", "·"), bx - 10, y + rh * 0.72, { size: 12, color: chosen ? "ok" : kept ? "ink" : "ink-3", align: "right", weight: chosen ? 700 : 500 });
+      g.rect(bx, y + 2, Math.max(2, bw * p / pmax), rh - 4, { fill: chosen ? "ok" : kept ? "compute" : "ink-3", r: 2, a: kept ? 0.88 : 0.22 });
+      g.text((p * 100).toFixed(p < 0.01 ? 2 : 1) + "%", bx + Math.max(2, bw * p / pmax) + 6, y + rh * 0.72, { size: 11, color: kept ? "ink-2" : "ink-3" });
+    });
+    // cumulative stack of kept tokens
+    const sx = narrow ? W - 110 : W * 0.66, sw = 46, sy0 = 30, sy1 = H - 110;
+    let yy = sy0;
+    for (let i = 0; i < r.keep; i++) {
+      const h = (sy1 - sy0) * r.ps[i] / r.ks;
+      g.rect(sx, yy, sw, Math.max(1, h - 1), { fill: i === r.pick ? "ok" : "compute", a: i === r.pick ? 0.95 : 0.25 + 0.2 * (i % 2) });
+      if (h > 16 && !narrow) g.text(LTOK[i].trim(), sx + sw + 8, yy + h / 2 + 4, { size: 11, color: i === r.pick ? "ok" : "ink-3", weight: i === r.pick ? 700 : 500 });
+      yy += h;
+    }
+    g.rect(sx, sy0, sw, sy1 - sy0, { stroke: "ink-3", lw: 1, r: 2 });
+    const uy = sy0 + (sy1 - sy0) * r.u;
+    g.head(sx - 2, uy, 0, { color: "ink", size: 11 });
+    g.line(sx - 28, uy, sx - 6, uy, { color: "ink", lw: 1.5 });
+    g.text("u", sx - 34, uy + 5, { size: 13, color: "ink", weight: 700, align: "right" });
+    g.text("kept, renormalized", narrow ? sx + sw : sx, sy1 + 18, { size: 11, color: "ink-3", align: narrow ? "right" : "left" });
+    g.text(`u = hash(seed ${st.seed}, pos 0) = ${r.u.toFixed(3)}`, sx - (narrow ? 200 : 60), sy1 + 38, { size: 12, color: "ink-2" });
+    // next positions
+    const ny = H - 34;
+    g.text("same seed, positions 0–5:", x0, ny, { size: 12, color: "ink-3" });
+    let px = x0 + g.tw("same seed, positions 0–5:", 12, "mono", 500) + 12;
+    for (let pos = 0; pos < 6; pos++) {
+      const rr = lab(st.temp, st.topp, st.topk, st.seed, pos);
+      px += g.pill(px, ny - 4, LTOK[rr.pick].trim(), { size: 12, color: pos === 0 ? "ok" : "ink-2", stroke: pos === 0 ? "ok" : "hair" }) + 6;
+      if (px > W - 60) break;
+    }
+  }, { controls: "samp-ctl", format: (id, v) => (id === "topk" || id === "seed" ? String(v) : v.toFixed(2)) });
+
+  /* ---------------- grammar ---------------- */
+  Atlas.scene("gram", (g, s) => {
+    const { W, H, narrow } = g;
+    const a0 = s.solo(0), a1 = s.solo(1), a2 = s.solo(2), a3 = s.solo(3);
+    const x0 = 40, x1 = W - 40;
+    if (a0 > 0.01) {
+      const tt = (s.t % 8) / 8, lanes = [["engine steps", "compute"], ["xgrammar worker", "cpu"], ["new request", "memory"]];
+      const lx = x0 + (narrow ? 0 : 150), ly0 = 90, lh = 70;
+      lanes.forEach(([lab_, c], i) => {
+        const y = ly0 + i * lh;
+        if (narrow) g.text(lab_, x0, y - 6, { size: 12, color: c, weight: 600, a: a0 }); else g.text(lab_, lx - 14, y + 26, { size: 13, color: c, weight: 600, align: "right", a: a0 });
+        g.line(lx, y + 40, x1, y + 40, { color: "hair", lw: 1, a: a0 });
+      });
+      const tw = x1 - lx;
+      for (let k = 0; k < 14; k++) { const xs = lx + k * tw / 14; g.rect(xs + 2, ly0 + 8, tw / 14 - 4, 28, { fill: "compute", r: 3, a: a0 * (xs < lx + tw * tt ? 0.8 : 0.25) }); }
+      const c0 = lx + tw * 0.12, c1 = lx + tw * 0.55;
+      g.rect(c0, ly0 + lh + 8, (c1 - c0), 28, { fill: "cpu", r: 4, a: a0 * 0.3 });
+      g.rect(c0, ly0 + lh + 8, Math.max(0, Math.min(c1, lx + tw * tt) - c0), 28, { fill: "cpu", r: 4, a: a0 * 0.85 });
+      g.text("compile JSON schema", c0 + 10, ly0 + lh + 27, { size: 12, color: "sheet", weight: 600, a: a0 });
+      g.rect(c0 - 30, ly0 + 2 * lh + 8, 26, 28, { fill: "memory", r: 4, a: a0 * 0.8 });
+      g.line(c0 - 4, ly0 + 2 * lh + 22, c1, ly0 + 2 * lh + 22, { color: "memory", lw: 1.5, dash: [4, 4], a: a0 });
+      g.text("waits, engine keeps stepping", c0 + 6, ly0 + 2 * lh + 16, { size: 11, color: "memory", a: a0 });
+      const ready = tt > 0.55;
+      g.rect(c1, ly0 + 2 * lh + 8, x1 - c1, 28, { fill: "memory", r: 4, a: a0 * (ready ? 0.75 : 0.15) });
+      g.text(ready ? "scheduled with its matcher" : "", c1 + 10, ly0 + 2 * lh + 27, { size: 12, color: "sheet", weight: 600, a: a0 });
+      g.curve([c1, ly0 + lh + 38], [c1 + 20, ly0 + lh + 60], [c1 + 4, ly0 + 2 * lh + 6], { color: "cpu", lw: 1.5, head: 8, a: a0 * (ready ? 1 : 0.2) });
+      const by = ly0 + 3 * lh + 30;
+      g.box(x0, by, (x1 - x0) / 2 - 10, 86, { color: "cpu", title: "grammar cache", sub: "byte limit · 10 GiB default", tsize: 18, ssize: 12, a: a0 });
+      g.box(x0 + (x1 - x0) / 2 + 10, by, (x1 - x0) / 2 - 10, 86, { color: "bad", title: "20 s timeout", sub: "matcher aborted · request fails alone", tsize: 18, ssize: 12, a: a0 });
+    }
+    if (a1 > 0.01) {
+      const txt = '{"name": "', allowed = ['Ada', 'Bo', 'Ch', 'D', '\\"', 'x'], banned = ['}', ',', '42', 'true', ' {', 'null'];
+      g.text("generated so far", x0, 60, { size: 12, color: "ink-3", a: a1 });
+      g.text(txt, x0, 92, { size: 24, color: "ink", weight: 600, a: a1 });
+      const cw = g.tw(txt, 24, "mono", 600);
+      if (Math.floor(s.t * 2) % 2) g.rect(x0 + cw + 2, 70, 3, 28, { fill: "ink", a: a1 });
+      // bitmask grid
+      const cols = narrow ? 32 : 48, rows = 6, gx = x0, gy = 126, cs = Math.min(14, (x1 - x0) / cols);
+      const R = rng(3);
+      for (let r_ = 0; r_ < rows; r_++) for (let c = 0; c < cols; c++) {
+        const on = R() < 0.42;
+        g.rect(gx + c * cs + 1, gy + r_ * cs + 1, cs - 2, cs - 2, { fill: on ? "ok" : "hair", r: 2, a: a1 * (on ? 0.75 : 0.6) });
+      }
+      g.text("bitmask: 1 bit per vocabulary id · 129,280 bits ≈ 16 KB per row", gx, gy + rows * cs + 22, { size: 12, color: "ink-2", a: a1 });
+      const cy = gy + rows * cs + 60;
+      let xx = x0;
+      g.text("allowed", x0, cy, { size: 12, color: "ok", weight: 600, a: a1 });
+      xx = x0 + 80; allowed.forEach((t) => { xx += g.pill(xx, cy - 4, t, { size: 13, color: "ok", stroke: "ok", a: a1 }) + 6; });
+      g.text("→ −∞", x0, cy + 40, { size: 12, color: "bad", weight: 600, a: a1 });
+      xx = x0 + 80; banned.forEach((t) => { xx += g.pill(xx, cy + 36, t, { size: 13, color: "ink-3", stroke: "hair", a: a1 * 0.8 }) + 6; });
+      // pipeline
+      const py = cy + 90;
+      if (py + 60 < H) {
+        const steps = [["CPU fills mask", "cpu"], ["side-stream copy", "net"], ["kernel masks logits", "compute"]];
+        const sw = (x1 - x0) / 3;
+        steps.forEach(([t, c], i) => { g.box(x0 + i * sw + (i ? 8 : 0), py, sw - 8, 46, { color: c, title: t, tsize: narrow ? 13 : 15, tfont: "mono", tweight: 600, a: a1 }); });
+        g.text("overlaps with the logits GEMM", x0, py + 70, { size: 12, color: "ink-3", a: a1 });
+      }
+    }
+    if (a2 > 0.01) {
+      const toks = ["{", '"id"', ":", "7", "}x"], ok = [true, true, true, true, false];
+      const n = 5, sx0 = x0 + 20, sw = (x1 - sx0 - 20) / n, y = Math.max(190, H * 0.3);
+      const walk = clamp(((s.t % 7) - 0.3) / 3.0) * 4.0, back = ease(clamp(((s.t % 7) - 3.8) / 1.0));
+      for (let i = 0; i <= n; i++) {
+        const x = sx0 + i * sw, reached = i <= Math.floor(walk + 1e-6) && i <= 4;
+        g.circle(x, y, 16, { fill: reached ? "cpu" : "sheet", stroke: "cpu", lw: 2, a: a2 * (i === 5 ? 0.25 : 1) });
+        g.text("s" + i, x, y + 5, { size: 12, color: reached ? "sheet" : "cpu", align: "center", weight: 700, a: a2 * (i === 5 ? 0.3 : 1) });
+        if (i < n) {
+          const good = ok[i];
+          g.arrow(x + 18, y, x + sw - 18, y, { color: good ? "cpu" : "bad", lw: 1.5, head: 8, a: a2 * (good ? 1 : 0.6), dash: good ? null : [4, 4] });
+          g.pill(x + sw / 2, y - 34, i === 0 ? "token" : "d" + i + " " + toks[i], { size: 12, align: "center", color: good ? "ink" : "bad", stroke: good ? "hair" : "bad", a: a2 });
+          if (i < 4 && walk >= i) {
+            g.rect(x - 14, y + 34, 28, 50, { fill: "ok", r: 3, a: a2 * 0.25 });
+            for (let b = 0; b < 6; b++) g.rect(x - 10, y + 38 + b * 7.5, 20, 5, { fill: (b + i) % 3 ? "ok" : "hair", r: 1, a: a2 * 0.85 });
+            g.text("mask " + i, x, y + 104, { size: 11, color: "ok", align: "center", a: a2 });
+          }
+        }
+      }
+      if (walk >= 3.9) g.text("d4 not in grammar: stop walking", x1, y + 54, { size: 12, color: "bad", weight: 600, align: "right", a: a2 });
+      if (back > 0.01) {
+        const xa = sx0 + 3 * sw, xb = sx0;
+        g.curve([lerp(xa, xa, 0), y - 70], [(xa + xb) / 2, y - 130], [lerp(xa, xb, back), y - 70], { color: "memory", lw: 2, head: 9, a: a2 });
+        g.text("rollback(3)", (xa + xb) / 2, y - 120, { size: 14, color: "memory", weight: 700, align: "center", a: a2 * back });
+      }
+      const ty = y + 150;
+      g.text("one pass fills a mask for the real token and every reachable draft", x0, ty, { size: 13, color: "ink-2", a: a2 });
+      g.text("next step: accept the tokens actually emitted, then repeat", x0, ty + 24, { size: 13, color: "ink-2", a: a2 });
+    }
+    if (a3 > 0.01) {
+      const toks = ["Let", " me", " look", " that", " up", ".", "<tool", "<tool", "▁call>", "{", '"q"', ":", ' "kv"', "}"];
+      const trig = [6, 7, 8];
+      const prog = [0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 2, 2, 2, 2];
+      const shown = Math.min(toks.length, Math.floor((s.t % 9) * 2.2));
+      let x = x0, y = 100;
+      const fs = narrow ? 13 : 15;
+      toks.forEach((t, i) => {
+        if (i >= shown) return;
+        const w = g.tw(t, fs, "mono", 600) + 18;
+        if (x + w > x1) { x = x0; y += 56; }
+        const isTrig = i === 7 || i === 8, grammar = i >= 9, partial = i === 6;
+        const c = grammar ? "ok" : isTrig ? "memory" : partial ? "cpu" : "ink-2";
+        g.rect(x, y - 16, w, 32, { fill: grammar ? "ok" : isTrig ? "memory" : "sheet", stroke: c, lw: 1.5, r: 6, a: a3 * (grammar || isTrig ? 0.2 : 1) });
+        g.rect(x, y - 16, w, 32, { stroke: c, lw: 1.5, r: 6, a: a3 });
+        g.text(t, x + w / 2, y + 5, { size: fs, color: c, align: "center", weight: 600, a: a3 });
+        g.text(String(i === 6 ? 1 : i === 7 ? 1 : i === 8 ? 2 : i > 8 ? "✓" : 0), x + w / 2, y + 34, { size: 10, color: "ink-3", align: "center", a: a3 * (i < 9 ? 1 : 0) });
+        x += w + 6;
+      });
+      void trig; void prog;
+      const ly = y + 80;
+      g.text("free text: no mask", x0, ly, { size: 13, color: "ink-2", a: a3 });
+      g.text("trigger <tool▁call> (2 tokens): KMP progress under each token", x0, ly + 24, { size: 13, color: "memory", weight: 600, a: a3 });
+      g.text("a repeated '<tool' falls back via the failure table instead of resetting", x0, ly + 48, { size: 12, color: "cpu", a: a3 });
+      g.text("after the trigger: every token masked by the grammar", x0, ly + 72, { size: 13, color: "ok", weight: 600, a: a3 });
+      g.text("tokens and trigger are illustrative", x0, ly + 100, { size: 11, color: "ink-3", a: a3 });
+    }
+  }, { anim: true, restT: 6.5 });
+
+  /* ---------------- determinism ---------------- */
+  Atlas.scene("det", (g, s) => {
+    const { W, H, narrow } = g;
+    const a0 = s.solo(0), a1 = s.solo(1), a2 = s.solo(2);
+    const x0 = 40, x1 = W - 40;
+    const f = Math.fround;
+    if (a0 > 0.01) {
+      const tree = (cx, y, order, title) => {
+        const v = order.map(f);
+        let res, mid1, mid2;
+        if (title === "A") { mid1 = f(v[0] + v[1]); mid2 = f(mid1 + v[2]); res = f(mid2 + v[3]); }
+        else { mid1 = f(v[0] + v[1]); mid2 = f(v[2] + v[3]); res = f(mid1 + mid2); }
+        const lab = (n) => (Math.abs(n) >= 1e6 ? (n / 1e8).toFixed(n % 1e8 === 0 ? 0 : 8).replace(/0+$/, "").replace(/\.$/, "") + "e8" : String(n));
+        const sp = narrow ? 64 : 84;
+        order.forEach((n, i) => g.pill(cx + (i - 1.5) * sp, y, lab(n), { size: 12, align: "center", a: a0 }));
+        const yy = y + 70, y2 = y + 140, y3 = y + 210;
+        if (title === "A") {
+          g.pill(cx - sp, yy, lab(mid1), { size: 12, align: "center", color: "bad", stroke: "bad", a: a0 });
+          g.line(cx - 1.5 * sp, y + 14, cx - sp, yy - 14, { a: a0 }); g.line(cx - 0.5 * sp, y + 14, cx - sp, yy - 14, { a: a0 });
+          g.pill(cx - 0.4 * sp, y2, lab(mid2), { size: 12, align: "center", a: a0 });
+          g.line(cx - sp, yy + 14, cx - 0.4 * sp, y2 - 14, { a: a0 }); g.line(cx + 0.5 * sp, y + 14, cx - 0.4 * sp, y2 - 14, { a: a0 });
+          g.pill(cx + 0.3 * sp, y3, lab(res), { size: 18, align: "center", color: "ink", weight: 700, a: a0 });
+          g.line(cx - 0.4 * sp, y2 + 14, cx + 0.3 * sp, y3 - 16, { a: a0 }); g.line(cx + 1.5 * sp, y + 14, cx + 0.3 * sp, y3 - 16, { a: a0 });
+          g.text("1e8 + 1", cx - sp - 30, yy - 2, { size: 11, color: "bad", align: "right", a: a0 });
+          g.text("rounds to 1e8", cx - sp - 30, yy + 13, { size: 11, color: "bad", align: "right", a: a0 });
+        } else {
+          g.pill(cx - sp, yy, lab(mid1), { size: 12, align: "center", a: a0 });
+          g.pill(cx + sp, yy, lab(mid2), { size: 12, align: "center", a: a0 });
+          g.line(cx - 1.5 * sp, y + 14, cx - sp, yy - 14, { a: a0 }); g.line(cx - 0.5 * sp, y + 14, cx - sp, yy - 14, { a: a0 });
+          g.line(cx + 0.5 * sp, y + 14, cx + sp, yy - 14, { a: a0 }); g.line(cx + 1.5 * sp, y + 14, cx + sp, yy - 14, { a: a0 });
+          g.pill(cx, y3, lab(res), { size: 18, align: "center", color: "ink", weight: 700, a: a0 });
+          g.line(cx - sp, yy + 14, cx, y3 - 16, { a: a0 }); g.line(cx + sp, yy + 14, cx, y3 - 16, { a: a0 });
+        }
+        return res;
+      };
+      const cxA = narrow ? W / 2 : W * 0.27, cxB = narrow ? W / 2 : W * 0.73;
+      const yA = 90, yB = narrow ? 90 + 300 : 90;
+      g.text("sequential (small batch)", cxA, yA - 30, { size: 13, color: "ink-2", align: "center", weight: 600, a: a0 });
+      tree(cxA, yA, [1e8, 1, -1e8, 1], "A");
+      if (!narrow) {
+        g.text("split in two (bigger batch)", cxB, yB - 30, { size: 13, color: "ink-2", align: "center", weight: 600, a: a0 });
+        tree(cxB, yB, [1e8, -1e8, 1, 1], "B");
+      }
+      g.text("same four FP32 numbers · different order · different sum", x0, H - 70, { size: 14, color: "ink", weight: 600, a: a0 });
+      g.text("in a model, the gaps are tiny, but a near-tie between two tokens can flip", x0, H - 44, { size: 13, color: "ink-2", a: a0 });
+    }
+    if (a1 > 0.01) {
+      const R = rng(17);
+      const diffs = []; for (let i = 0; i < 64; i++) diffs.push((R() - 0.5) * (0.3 + R()));
+      const bi = ease(clamp(((s.t % 6) - 2.0) / 0.8));
+      const gx0 = x0, gx1 = x1, gy = H * 0.36, amp = H * 0.14;
+      g.text("logit difference for one request: alone vs batched with 63 others", gx0, 64, { size: 13, color: "ink-2", a: a1 });
+      g.line(gx0, gy, gx1, gy, { color: "ink-3", lw: 1, a: a1 });
+      diffs.forEach((d, i) => { const x = gx0 + i * (gx1 - gx0) / 64, h = d * amp * (1 - bi); g.rect(x, Math.min(gy, gy - h), (gx1 - gx0) / 64 * 0.6, Math.max(1, Math.abs(h)), { fill: bi > 0.5 ? "ok" : "bad", r: 1, a: a1 * 0.8 }); });
+      g.text(bi < 0.5 ? "default: tiny, nonzero differences" : "DEEPINFER_BATCH_INVARIANT=1: exactly zero", gx0, gy + amp + 30, { size: 15, color: bi < 0.5 ? "bad" : "ok", weight: 700, a: a1 });
+      const items = ["DeepGEMM, TileKernels: deterministic algorithms", "FlashMLA: batch-invariant mode", "one fused prefill path avoided", "NVIDIA only (Ascend: not yet)"];
+      items.forEach((t, i) => g.text("· " + t, gx0, gy + amp + 66 + i * 24, { size: 13, color: "ink-2", a: a1 }));
+      const ty = gy + amp + 66 + items.length * 24 + 20;
+      if (ty < H - 20) g.text("test: 64 prompts · batched vs one at a time · 5 drafts · tokens and logprobs equal", gx0, ty, { size: 12, color: "ink-3", a: a1 });
+    }
+    if (a2 > 0.01) {
+      const bx = x0, cw = (x1 - x0 - 30) / 2, ry = 100, rh = 30;
+      [["batch A", 2], ["batch B", 5]].forEach(([lab_, at], k) => {
+        const x = bx + k * (cw + 30);
+        g.text(lab_, x, ry - 16, { size: 14, color: "ink", weight: 700, a: a2 });
+        for (let r = 0; r < 7; r++) {
+          const me = r === at;
+          g.rect(x, ry + r * (rh + 6), cw, rh, { fill: me ? "memory" : "grid", r: 4, a: a2 * (me ? 0.25 : 1) });
+          g.text(me ? "our request · seed 0x5DEEC0DE, pos 17" : "other request", x + 10, ry + r * (rh + 6) + 20, { size: narrow ? 10 : 12, color: me ? "memory" : "ink-3", weight: me ? 600 : 500, a: a2 });
+        }
+      });
+      const hy = ry + 7 * (rh + 6) + 30;
+      g.box(W / 2 - 110, hy, 220, 50, { color: "ink-3", title: "u = " + u01(0x5DEEC0DE, 17).toFixed(4), tsize: 18, tfont: "mono", tweight: 700, a: a2 });
+      g.curve([bx + cw / 2, ry + 2 * (rh + 6) + rh], [bx + cw / 2, hy + 25], [W / 2 - 112, hy + 25], { color: "memory", lw: 1.5, head: 8, a: a2 });
+      g.curve([bx + cw * 1.5 + 30, ry + 5 * (rh + 6) + rh], [bx + cw * 1.5 + 30, hy + 25], [W / 2 + 112, hy + 25], { color: "memory", lw: 1.5, head: 8, a: a2 });
+      g.text("same seed + same position → same draw, wherever the row sits", x0, hy + 84, { size: 13, color: "ok", weight: 600, a: a2 });
+      g.text("but verify length must not depend on the batch: DEEPINFER_ENABLE_MTP_VARLEN=0", x0, hy + 110, { size: 13, color: "bad", a: a2 });
+    }
+  }, { anim: true, restT: 3 });
+})();
+
+</script>
+<script>AtlasAlts.render("alts-sampling", "sources-sampling", "sampling");</script>
+</body>
+</html>

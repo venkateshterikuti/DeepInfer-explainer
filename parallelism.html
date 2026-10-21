@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>One model, many GPUs · DeepInfer Annotated</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&display=swap">
+<link rel="stylesheet" href="atlas.css">
+</head>
+<body>
+<header class="bar">
+  <div class="wrap">
+    <a class="brand" href="index.html"><b>DeepInfer</b><span>annotated</span></a>
+    <nav aria-label="Chapters">
+      <a class="num" href="loop.html" title="The generation loop">01</a>
+      <a class="num" href="model.html" title="The model it serves">02</a>
+      <a class="num" href="engine.html" title="Anatomy of the engine">03</a>
+      <a class="num" href="memory.html" title="KV memory">04</a>
+      <a class="num" href="scheduling.html" title="Scheduling a step">05</a>
+      <a class="num" href="parallelism.html" aria-current="page" title="One model, many GPUs">06</a>
+      <a class="num" href="cluster.html" title="The cluster around it">07</a>
+      <a class="num" href="replay.html" title="Bounded replay">08</a>
+      <a class="num" href="speculation.html" title="Speculative decoding">09</a>
+      <a class="num" href="kernels.html" title="Numbers and kernels">10</a>
+      <a class="num" href="sampling.html" title="Sampling, structure, determinism">11</a>
+      <a class="num" href="frontdoor.html" title="The front door">12</a>
+      <a class="num" href="measure.html" title="Measuring it">13</a>
+      <a href="index.html">Map</a>
+    </nav>
+  </div>
+  <div class="progress"></div>
+</header>
+<main>
+  <section class="hero">
+    <div class="wrap">
+      <div>
+        <span class="eyebrow"><span class="n">06</span> Space</span>
+        <h1>One model, <em>many GPUs</em></h1>
+        <p class="dek">V4.1 is too big and too sparse for one GPU. DeepInfer splits attention by request and experts by GPU, then works hard to keep every GPU's share of experts equally busy.</p>
+        <div class="files">
+          <span class="tag">parallel_utils/parallel_state.py</span>
+          <span class="tag">parallel_utils/cp.py</span>
+          <span class="tag">v4_modules/moe.py</span>
+          <span class="tag">eplb/policy.py</span>
+          <span class="tag">eplb/shuffle.py</span>
+        </div>
+      </div>
+      <div class="board stage-card" data-stage="grid64" data-label="Sixty-four GPUs in an eight by eight grid; tokens leave each GPU's attention block for expert slots on other GPUs and return.">
+        <span class="ruler">EP64 · DP64 · one scale-up domain</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <div class="facts">
+        <div><b>EP2–8</b><span>prefill: the smallest expert-parallel size that fits in HBM</span></div>
+        <div><b>EP64–128</b><span>decode: the largest the scale-up domain allows</span></div>
+        <div><b>#DP = #EP</b><span>every GPU runs attention for its own requests</span></div>
+        <div><b>7</b><span>expert slots per GPU at EP64 (6 experts + 1 spare)</span></div>
+        <div><b>1.090</b><span>slowest ÷ mean expert load in decode after balancing</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="attention">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Splitting attention</span>
+        <h2>Split by request, not by matrix</h2>
+        <p class="lede">There are three ways to spread attention over GPUs. DeepInfer uses the second everywhere and the third only for very long prompts.</p>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">Tensor parallel</span><h4>Every GPU holds a slice of every matrix</h4><p>Tensor parallelism cuts each weight matrix across GPUs and all-reduces after each layer. For a model with one shared KV head, it can't split the cache by head, so every GPU stores the whole cache. At TP8 that's eight copies.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Data parallel</span><h4>Every GPU owns its requests</h4><p>With data-parallel attention, each GPU runs attention for its own set of requests and stores only their KV. No cache is duplicated and no all-reduce is needed for attention. DeepInfer sets the number of DP ranks equal to the number of expert-parallel ranks.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Context parallel</span><h4>One giant prompt, several GPUs, equal work</h4><p>For a single very long prefill, context parallelism splits the sequence across ranks. Causal attention makes later tokens costlier, so a naive split overloads the last rank. DeepInfer's mirror layout gives each rank a chunk from the front and its mirror from the back, then all-gathers the KV.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="attn" data-label="Four GPUs: under tensor parallelism each holds a full copy of the cache; under data parallelism each holds only its own requests' caches; under mirror context parallelism a long prompt's causal-attention triangle is divided into balanced front-and-back pairs."><span class="ruler">4 GPUs · attention</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="ep">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Expert parallelism</span>
+        <h2>Send tokens to experts, not experts to tokens</h2>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">Placement</span><h4>Experts spread across the group</h4><p>Most weights are expert weights. Spreading them over 64 GPUs leaves each with 7 slots at EP64: (384 experts + 64 spares) ÷ 64. Every decode step, each GPU reads only its own 7 experts' weights.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Dispatch</span><h4>All-to-all, out</h4><p>After attention, each token's hidden state is sent to the GPUs that hold its 6 chosen experts. Every GPU sends to every other: an all-to-all exchange over NVLink, run by DeepEP.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Combine</span><h4>All-to-all, back</h4><p>Each expert GPU runs its experts on whatever tokens arrived, from every request in the group, and sends results back. The token's home GPU sums the six weighted outputs plus the shared expert's.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Why wide for decode</span><h4>More tokens per expert, fewer bytes per GPU</h4><p>Decode is memory-bound: spreading experts thinner means each GPU reads fewer weight bytes per step, and each expert batches tokens from all 64 GPUs' requests. Prefill is compute-bound and long, so it uses the smallest EP that fits and keeps communication low.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="a2a" data-label="Eight GPUs in a ring, each with an attention block and expert slots; token dots travel from attention to expert slots on other GPUs and return; a comparison of decode throughput at EP8 and EP64."><span class="ruler">dispatch · combine</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="eplb">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Expert load balancing</span>
+        <h2>The slowest GPU sets the pace</h2>
+        <p class="lede">Every rank waits at every all-to-all, so one overloaded GPU slows the whole group. Balancing is a statistics problem plus a packing problem.</p>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">Skew</span><h4>Some experts are popular</h4><p>Routing isn't uniform. Whichever GPU happens to hold the hottest experts receives the most tokens, and the step can't finish until it does.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Statistics</span><h4>Count tokens per expert, per step</h4><p>The engine records how many tokens each logical expert received at every step. Decode keeps a 1,000-step window and re-places every 10,000 steps; prefill keeps 100 steps and re-places every 1,000.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Replicate and pack</span><h4>A greedy placement that respects time</h4><p>Hot experts get replicas in the spare slots, splitting their load. Then physical experts are placed one by one, heaviest first, on the rank that least increases Σ over steps of the busiest rank's load. Summing per-step peaks, instead of averaging, rewards placements that are balanced at every moment.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Move the weights</span><h4>Shuffle over NVLink, measure again</h4><p>Expert weights move between GPUs in the group over NVLink symmetric memory. Measured result: the slowest rank carries 1.090× the mean in decode, and 1.045–1.074× in prefill.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="eplb" data-label="Load bars for eight GPUs: one much taller; a heat map of token counts per expert over recent steps; replicas placed into spare slots; bars converging to near-equal height."><span class="ruler">load per GPU</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="lab">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Try it</span>
+        <h2>Pack the experts</h2>
+        <p class="lede">A simplified version of the placement policy: replicate the hottest experts into spare slots, then place heaviest-first on the least loaded GPU. Turn up the skew and watch the spares earn their keep.</p>
+      </header>
+      <div class="lab">
+        <div class="controls" id="eplb-ctl">
+          <div class="ctl"><label for="ranks">GPUs in the group <output for="ranks">8</output></label><input type="range" id="ranks" min="4" max="16" step="4" value="8"></div>
+          <div class="ctl"><label for="spare">Spare slots per GPU <output for="spare">1</output></label><input type="range" id="spare" min="0" max="3" step="1" value="1"></div>
+          <div class="ctl"><label for="skew">Routing skew (Zipf exponent) <output for="skew">0.9</output></label><input type="range" id="skew" min="0" max="1.6" step="0.1" value="0.9"></div>
+          <div class="ctl"><label>Placement</label>
+            <div class="seg" id="mode"><button type="button" value="naive" aria-pressed="false">round-robin</button><button type="button" value="greedy" aria-pressed="true">greedy + replicas</button></div>
+          </div>
+          <div class="readout">
+            <div><b id="e-lb">–</b><span>slowest ÷ mean</span></div>
+            <div><b id="e-step">–</b><span>step time vs perfect</span></div>
+          </div>
+          <p class="note">48 experts here instead of 384, and one aggregated load per expert instead of per-step vectors, so the lab runs instantly.</p>
+        </div>
+        <div class="board" data-stage="pack" data-label="Bars of total load per GPU, built from stacked expert blocks; a dashed line marks the mean load."><span class="ruler">load per GPU · stacked experts</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="code">
+    <div class="wrap stack">
+      <header>
+        <span class="eyebrow">In the repo</span>
+        <h2>The objective, in the code's own words</h2>
+      </header>
+      <div class="split">
+        <div class="code">
+          <div class="hd"><span>eplb/policy.py · _batch_greedy_indices (translated)</span><a href="https://github.com/deepseek-ai/DeepInfer/blob/main/deepinfer/model_executor/eplb/policy.py" target="_blank" rel="noopener">source</a></div>
+<pre><span class="c"># Objective is independent per layer. For a fixed layer, assign its</span>
+<span class="c"># physical experts to ranks so that</span>
+<span class="c">#   sum over step i of max over rank j of</span>
+<span class="c">#     (sum of loads at step i of experts placed on rank j)</span>
+<span class="c"># is as small as possible.</span>
+<span class="c"># Greedy: try the current expert on every rank and keep the</span>
+<span class="c"># placement that minimizes the objective so far.</span>
+<span class="k">for</span> job_index <span class="k">in</span> range(num_physical):
+    experts = expert_order[:, job_index]
+    vector = vectors[layers, experts]
+    torch.add(loads, vector.unsqueeze(<span class="n">1</span>), out=candidates)
+    torch.maximum(candidates, peaks.unsqueeze(<span class="n">1</span>), out=candidates)
+    torch.sum(candidates, dim=-<span class="n">1</span>, out=scores)
+    ...</pre>
+        </div>
+        <div class="prose">
+          <p>The placement runs for all MoE layers at once as tensor operations, so recomputing it every few thousand steps is cheap. Experts are visited in order of their historical load per replica, heaviest first.</p>
+          <p>A replica splits its expert's traffic evenly, which is why the loads are divided by <code>logical_count</code> before packing.</p>
+          <p>The redundant-expert count is a lower bound: the engine rounds <code>num_routed_experts + num_extra_experts</code> up to a multiple of the EP size, separately for the main model and the drafter.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="others">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Other ways to do it</span>
+        <h2>Who spreads experts, and how</h2>
+      </header>
+      <div class="compare" id="alts-parallelism"></div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap"><div class="sources" id="sources-parallelism"></div></div>
+  </section>
+
+</main>
+<nav class="next" aria-label="Chapter navigation">
+  <div class="wrap">
+    <a href="scheduling.html"><span>← Chapter 05</span><b>Scheduling a step</b></a>
+    <a class="fwd" href="cluster.html"><span>Chapter 07 →</span><b>The cluster around it</b></a>
+  </div>
+</nav>
+<script src="atlas.js"></script>
+<script src="alts.js"></script>
+<script>
+(function () {
+  const { ramp, ease, clamp, lerp, rng } = Atlas;
+
+  /* ---------------- hero: 64 GPUs with traffic ---------------- */
+  Atlas.scene("grid64", (g, s) => {
+    const { W, H } = g;
+    const cols = 8, gx = 40, gy = 40, cw = (W - 80) / cols, ch = (H - 90) / 8;
+    const xy = (i) => [gx + (i % cols) * cw, gy + Math.floor(i / cols) * ch];
+    for (let i = 0; i < 64; i++) {
+      const [x, y] = xy(i);
+      g.rect(x + 3, y + 3, cw - 6, ch - 6, { fill: "sheet", stroke: "hair", r: 6 });
+      g.rect(x + 8, y + 8, (cw - 16) * 0.45, (ch - 16) * 0.42, { fill: "compute", r: 3, a: 0.7 });
+      for (let k = 0; k < 7; k++) g.rect(x + 8 + k * ((cw - 16) / 7), y + ch * 0.55, (cw - 16) / 7 - 2, (ch - 16) * 0.32, k < 6 ? { fill: "memory", r: 2, a: 0.8 } : { stroke: "memory", lw: 1, r: 2, dash: [2, 2] });
+    }
+    const R = rng(3);
+    for (let k = 0; k < 40; k++) {
+      const a = Math.floor(R() * 64), b = Math.floor(R() * 64), slot = Math.floor(R() * 6);
+      const per = 2.4, ph = ((s.t + k * 0.13) % per) / per;
+      const [ax, ay] = xy(a), [bx, by] = xy(b);
+      const p0 = [ax + 8 + (cw - 16) * 0.22, ay + 8 + (ch - 16) * 0.2], p2 = [bx + 8 + (slot + 0.5) * ((cw - 16) / 7), by + ch * 0.7];
+      const mid = [(p0[0] + p2[0]) / 2 + (p2[1] - p0[1]) * 0.2, (p0[1] + p2[1]) / 2 - (p2[0] - p0[0]) * 0.2];
+      const u = ph < 0.5 ? ease(ph * 2) : ease(2 - ph * 2);
+      const [px, py] = g.bez(p0, mid, p2, u);
+      g.circle(px, py, 4, { fill: ph < 0.5 ? "compute" : "ok" });
+    }
+    g.text("blue: dispatch to experts · green: combine back", gx, H - 18, { size: 13, color: "ink-3" });
+  }, { anim: true, restT: 1.1, zoom: 1.0, minW: 560 });
+
+  /* ---------------- splitting attention ---------------- */
+  const RQ = ["compute", "memory", "cpu", "net"];
+  Atlas.scene("attn", (g, s) => {
+    const { W, H, narrow } = g;
+    const tp = s.solo(0), dp = s.solo(1), cp = s.at(2);
+    const n = 4;
+    const gw = narrow ? (W - 70) / 2 : (W - 100) / 4, gh = narrow ? (H * 0.55 - 60) / 2 : H * 0.5;
+    const pos = (i) => narrow ? [30 + (i % 2) * (gw + 10), 60 + Math.floor(i / 2) * (gh + 14)] : [30 + i * (gw + 13.3), 70];
+    if (tp + dp > 0.01) {
+      for (let i = 0; i < n; i++) {
+        const [x, y] = pos(i);
+        g.rect(x, y, gw, gh, { fill: "sheet", stroke: "hair", r: 10, a: Math.max(tp, dp) });
+        g.text("GPU " + i, x + 12, y + 24, { size: 14, color: "ink-2", weight: 600, a: Math.max(tp, dp) });
+        // weights
+        const wy = y + 40;
+        g.text("attention weights", x + 12, wy + 2, { size: 11, color: "ink-3", a: Math.max(tp, dp) });
+        g.rect(x + 12, wy + 10, gw - 24, 18, { fill: "grid", r: 4, a: Math.max(tp, dp) });
+        g.rect(x + 12 + (gw - 24) * i / 4 * tp, wy + 10, (gw - 24) * (tp ? 0.25 : 1) * (tp > 0.5 ? 1 : 1), 18, { fill: "compute", r: 4, a: tp * 0.8 });
+        g.rect(x + 12, wy + 10, gw - 24, 18, { fill: "compute", r: 4, a: dp * 0.8 });
+        // KV caches
+        const ky = wy + 52;
+        g.text("KV cache", x + 12, ky, { size: 11, color: "ink-3", a: Math.max(tp, dp) });
+        const ch = Math.min(28, (y + gh - ky - 20) / 4);
+        for (let r = 0; r < 4; r++) {
+          const mine = r === i;
+          const a = tp * 0.8 + dp * (mine ? 0.85 : 0.08);
+          g.rect(x + 12, ky + 10 + r * (ch + 4), (gw - 24) * (0.5 + 0.12 * r), ch, { fill: RQ[r], r: 4, a });
+          if (dp > 0.5 && !mine) g.rect(x + 12, ky + 10 + r * (ch + 4), (gw - 24) * (0.5 + 0.12 * r), ch, { stroke: "hair", dash: [4, 4], r: 4, a: dp });
+        }
+      }
+      if (tp > 0.01) {
+        g.text("4 copies of every request's cache · all-reduce after each layer", 30, narrow ? H * 0.62 + 20 : 70 + gh + 40, { size: 15, color: "bad", weight: 600, a: tp });
+        for (let i = 0; i < n - 1; i++) { const [x, y] = pos(i), [x2] = pos(i + 1); if (!narrow) g.arrow(x + gw, y + gh / 2, x2, y + gh / 2, { color: "net", lw: 2, a: tp, head: 8 }); }
+      }
+      if (dp > 0.01) g.text("each GPU keeps only its own requests' cache · no attention all-reduce", 30, narrow ? H * 0.62 + 20 : 70 + gh + 40, { size: 15, color: "ok", weight: 600, a: dp });
+    }
+    if (cp > 0.01) {
+      // causal triangle split into 8 chunks
+      const tx = 30, ty = 70, ts = Math.min(narrow ? W - 60 : H * 0.62, W * 0.48);
+      const k = 8, cs = ts / k;
+      const mirror = (i) => (i < 4 ? i : 7 - i);
+      for (let r = 0; r < k; r++) for (let c = 0; c <= r; c++) {
+        g.rect(tx + c * cs + 1, ty + r * cs + 1, cs - 2, cs - 2, { fill: RQ[mirror(r)], r: 2, a: cp * 0.75 });
+      }
+      g.text("query chunk ↓ · key chunk →", tx, ty - 14, { size: 13, color: "ink-3", a: cp });
+      // work bars
+      const bx = narrow ? 30 : tx + ts + 50, by = narrow ? ty + ts + 40 : ty + 20, bw = narrow ? W - 60 : W - bx - 30;
+      const naive = [0, 1, 2, 3].map((rk) => (2 * rk + 1) + (2 * rk + 2)); // chunks 2rk,2rk+1 → work rows
+      const mir = [0, 1, 2, 3].map((rk) => (rk + 1) + (8 - rk));
+      const mx = Math.max(...naive);
+      g.text("work per rank", bx, by - 10, { size: 13, color: "ink-2", a: cp });
+      [0, 1, 2, 3].forEach((rk) => {
+        const y = by + rk * 46;
+        g.text("naive", bx, y + 18, { size: 11, color: "ink-3", a: cp });
+        g.rect(bx + 50, y + 6, (bw - 60) * naive[rk] / mx, 14, { fill: RQ[rk], r: 3, a: cp * 0.35 });
+        g.text("mirror", bx, y + 38, { size: 11, color: "ink-3", a: cp });
+        g.rect(bx + 50, y + 26, (bw - 60) * mir[rk] / mx, 14, { fill: RQ[rk], r: 3, a: cp * 0.9 });
+      });
+      g.text("rank r takes chunks r and 7−r, so every rank does 9 blocks of work", bx, by + 4 * 46 + 26, { size: 13, color: "ok", weight: 600, a: cp });
+      g.text("KV is then all-gathered (DeepEP BucketBuffer)", bx, by + 4 * 46 + 50, { size: 13, color: "ink-3", a: cp });
+    }
+  }, { anim: false });
+
+  /* ---------------- all-to-all ring ---------------- */
+  const EP64 = [[103, 26300], [179, 22800], [246, 15700], [297, 9500], [315, 5050], [325, 2600]];
+  const EP8 = [[98, 24900], [150, 19200], [198, 12600], [220, 7000], [230, 3700], [238, 1900]];
+  Atlas.scene("a2a", (g, s) => {
+    const { W, H, narrow } = g;
+    const chartA = s.swapIn(3);
+    const ringA = s.swapOut(3);
+    if (ringA > 0.01) {
+      const cx = W / 2, cy = H / 2 + 10, R = Math.min(W, H) * 0.36;
+      const n = 8, nodes = [];
+      for (let i = 0; i < n; i++) { const ang = -Math.PI / 2 + (i / n) * Math.PI * 2; nodes.push([cx + R * Math.cos(ang), cy + R * Math.sin(ang)]); }
+      const bw = narrow ? 92 : 112, bh = 64;
+      nodes.forEach(([x, y], i) => {
+        g.rect(x - bw / 2, y - bh / 2, bw, bh, { fill: "sheet", stroke: "hair", r: 8, a: ringA });
+        g.rect(x - bw / 2 + 6, y - bh / 2 + 6, bw - 12, 18, { fill: "compute", r: 3, a: ringA * 0.75 });
+        g.text("GPU " + i + " · attn", x, y - bh / 2 + 19, { size: 11, color: "sheet", align: "center", weight: 600, a: ringA });
+        for (let k = 0; k < 7; k++) g.rect(x - bw / 2 + 6 + k * ((bw - 12) / 7), y + 4, (bw - 12) / 7 - 2, 20, k < 6 ? { fill: "memory", r: 2, a: ringA * 0.85 } : { stroke: "memory", lw: 1, dash: [2, 2], r: 2, a: ringA });
+      });
+      const disp = s.at(1), comb = s.at(2);
+      const R2 = rng(9);
+      for (let k = 0; k < 28; k++) {
+        const a = Math.floor(R2() * n), b = (a + 1 + Math.floor(R2() * (n - 1))) % n, slot = Math.floor(R2() * 6);
+        const [ax, ay] = nodes[a], [bx2, by2] = nodes[b];
+        const p0 = [ax, ay - bh / 2 + 15], p2 = [bx2 - bw / 2 + 6 + (slot + 0.5) * ((bw - 12) / 7), by2 + 14];
+        const mid = [cx + (((p0[0] + p2[0]) / 2) - cx) * 0.3, cy + (((p0[1] + p2[1]) / 2) - cy) * 0.3];
+        const per = 2.6, ph = ((s.t + k * 0.09) % per) / per;
+        let u = 0, col = "compute";
+        if (comb > 0.5) { u = ph < 0.5 ? ease(ph * 2) : 1 - ease(ph * 2 - 1); col = ph < 0.5 ? "compute" : "ok"; }
+        else if (disp > 0.5) { u = ease(ph); }
+        else continue;
+        g.curve(p0, mid, p2, { color: "net", lw: 1, a: ringA * 0.2, arrow: false });
+        const [px, py] = g.bez(p0, mid, p2, u);
+        g.circle(px, py, 5, { fill: col, a: ringA });
+      }
+      g.text(comb > 0.5 ? "combine: results return and are summed with the gate weights" : disp > 0.5 ? "dispatch: each token goes to the GPUs holding its 6 experts" : "each GPU: attention for its requests + 7 expert slots", W / 2, H - 26, { size: 14, color: comb > 0.5 ? "ok" : "ink-2", align: "center", weight: 600, a: ringA });
+      g.chip(W / 2, cy, "DeepEP", "net", { align: "center", a: ringA * Math.max(disp, comb), size: 14 });
+    }
+    if (chartA > 0.01) {
+      g.chart({ x0: narrow ? 100 : 120, y0: 70, x1: W - 40, y1: H - 110, xmax: 350, ymax: 30000, xticks: [0, 100, 200, 300], yticks: [0, 10000, 20000, 30000], fy: (v) => (v ? v / 1000 + "k" : "0"),
+        xlabel: "per-user speed (tokens / s / user)", ylabel: "tokens / s / GPU", series: [{ pts: EP8, color: "bad" }, { pts: EP64, color: "compute" }], prog: [ramp(s.b, 2.4, 0.4), ramp(s.b, 2.6, 0.4)], a: chartA, tsize: 14, ylabelOff: 66 });
+      g.chip(W - 200, 100, "EP64 · 384+64", "compute", { a: chartA, size: 13 });
+      g.chip(W - 200, 136, "EP8 · 384+32", "bad", { a: chartA, size: 13 });
+      g.text("decode, 128K context, nextn = 3 · read from the repo's chart", W - 40, H - 30, { size: 12, color: "ink-3", align: "right", a: chartA });
+    }
+  }, { anim: true, restT: 1.3 });
+
+  /* ---------------- EPLB story ---------------- */
+  const BEFORE = [0.78, 0.85, 1.92, 0.74, 0.92, 0.81, 1.21, 0.77];
+  const AFTER = [1.02, 0.97, 1.09, 0.95, 1.01, 0.98, 1.03, 0.95];
+  Atlas.scene("eplb", (g, s) => {
+    const { W, H, narrow } = g;
+    const u = ease((s.b - 2.2) / 0.8);
+    const loads = BEFORE.map((v, i) => lerp(v, AFTER[i], u));
+    const mx = Math.max(...loads);
+    const bx0 = 40, bw = narrow ? (W - 80) / 8 : (W * 0.55 - 40) / 8, base = H - 80, sc = (H * 0.5) / 2;
+    loads.forEach((v, i) => {
+      const x = bx0 + i * bw, h = v * sc, hot = v >= mx - 1e-6 && u < 0.9;
+      g.rect(x + 6, base - h, bw - 12, h, { fill: hot ? "bad" : "compute", r: 5, a: 0.85 });
+      g.text("GPU" + i, x + bw / 2, base + 20, { size: 11, color: "ink-3", align: "center" });
+    });
+    g.line(bx0, base - sc, bx0 + 8 * bw, base - sc, { color: "ink-2", dash: [6, 5] });
+    g.text("mean", bx0 + 8 * bw + 6, base - sc + 4, { size: 12, color: "ink-2" });
+    g.line(bx0, base - mx * sc - 10, bx0 + 8 * bw, base - mx * sc - 10, { color: "bad", dash: [3, 5] });
+    g.text("step time ∝ max", bx0 + 8 * bw + 6, base - mx * sc - 6, { size: 12, color: "bad", weight: 600 });
+    // heatmap (beat 1)
+    const ha = s.at(1) * (narrow ? 1 - s.at(2) : 1);
+    if (ha > 0.01) {
+      const hx = narrow ? 40 : W * 0.6, hy = 70, hw = narrow ? W - 80 : W * 0.4 - 40, rows = 12, cols = 30;
+      const cw = hw / cols, chh = Math.min(16, (H * 0.42) / rows);
+      const R = rng(5);
+      const hot = { 2: 1, 7: 0.75, 10: 0.6 };
+      for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) g.rect(hx + c * cw, hy + r * chh, cw - 1.5, chh - 1.5, { fill: Atlas.mixc("grid", "memory", (hot[r] || 0.18) * (0.6 + 0.4 * R())), r: 1, a: ha });
+      g.text("tokens per expert · last N steps →", hx, hy - 12, { size: 12, color: "ink-3", a: ha });
+      g.text("decode: 1,000-step window, re-place every 10,000", hx, hy + rows * chh + 22, { size: 12, color: "memory", weight: 600, a: ha });
+    }
+    // replica flight (beat 2)
+    const ra = s.solo(2);
+    if (ra > 0.01) {
+      const fu = ease(((s.t % 3) / 2));
+      const p0 = [bx0 + 2 * bw + bw / 2, base - BEFORE[2] * sc - 10], p2 = [bx0 + 3 * bw + bw / 2, base - loads[3] * sc - 10];
+      const [px, py] = g.bez(p0, [(p0[0] + p2[0]) / 2, p0[1] - 80], p2, fu);
+      g.rect(px - 10, py - 8, 20, 16, { fill: "bad", r: 3, a: ra });
+      g.text("replica", px, py - 14, { size: 12, color: "bad", align: "center", a: ra });
+      g.text("greedy: heaviest first, onto the rank that least raises Σ step peaks", 40, 60, { size: 14, color: "ink", weight: 600, a: ra });
+    }
+    const fa = s.at(3);
+    if (fa > 0.01) {
+      g.text("1.090", 40, 110, { size: 64, font: "display", weight: 800, color: "ok", a: fa });
+      g.text("slowest ÷ mean, decode (measured)", 40, 136, { size: 14, color: "ink-2", a: fa });
+      g.text("prefill: 1.045–1.074 · weights move over NVLink", 40, 158, { size: 13, color: "ink-3", a: fa });
+    }
+  }, { anim: true, restT: 1.5 });
+
+  /* ---------------- packing lab ---------------- */
+  function pack(st) {
+    const E = 48, Rk = st.ranks, S = st.spare, skew = st.skew;
+    const R = rng(21);
+    const ids = Array.from({ length: E }, (_, i) => i).sort(() => R() - 0.5);
+    const load = new Array(E).fill(0);
+    ids.forEach((e, rank) => { load[e] = 1 / Math.pow(rank + 1, skew); });
+    const tot = load.reduce((a, b) => a + b, 0);
+    for (let e = 0; e < E; e++) load[e] = (load[e] * E) / tot;
+    const cap = E / Rk + (st.mode === "greedy" ? S : 0);
+    const bins = Array.from({ length: Rk }, () => ({ load: 0, items: [] }));
+    if (st.mode !== "greedy") {
+      for (let e = 0; e < E; e++) { const b = bins[e % Rk]; b.items.push([e, load[e], false]); b.load += load[e]; }
+    } else {
+      const count = new Array(E).fill(1);
+      for (let k = 0; k < Rk * S; k++) { let best = 0; for (let e = 1; e < E; e++) if (load[e] / count[e] > load[best] / count[best]) best = e; count[best]++; }
+      const items = [];
+      for (let e = 0; e < E; e++) for (let c = 0; c < count[e]; c++) items.push([e, load[e] / count[e], c > 0]);
+      items.sort((a, b) => b[1] - a[1]);
+      items.forEach((it) => { let bi = -1; for (let j = 0; j < Rk; j++) if (bins[j].items.length < cap && (bi < 0 || bins[j].load < bins[bi].load)) bi = j; bins[bi].items.push(it); bins[bi].load += it[1]; });
+    }
+    const mean = E / Rk, mx = Math.max(...bins.map((b) => b.load));
+    return { bins, mean, mx, lb: mx / mean };
+  }
+  Atlas.scene("pack", (g, s) => {
+    const st = s.state; if (st.ranks === undefined) return;
+    st.mode = st.mode || "greedy";
+    const r = pack(st);
+    document.getElementById("e-lb").textContent = r.lb.toFixed(3);
+    document.getElementById("e-step").textContent = "+" + ((r.lb - 1) * 100).toFixed(0) + "%";
+    const { W, H } = g;
+    const x0 = 50, x1 = W - 30, base = H - 60, top = 60;
+    const n = r.bins.length, bw = (x1 - x0) / n;
+    const ymax = Math.max(r.mx, r.mean * 1.6);
+    const sy = (v) => (base - top) * v / ymax;
+    r.bins.forEach((b, i) => {
+      let y = base;
+      b.items.forEach(([e, l, rep]) => {
+        const h = sy(l);
+        g.rect(x0 + i * bw + 5, y - h, bw - 10, h - 1, { fill: rep ? "sheet" : (e % 2 ? "compute" : "net"), stroke: rep ? "bad" : null, lw: 1.5, r: 2, a: rep ? 1 : 0.75 });
+        y -= h;
+      });
+      g.text(String(i), x0 + i * bw + bw / 2, base + 18, { size: 12, color: "ink-3", align: "center" });
+      if (b.load >= r.mx - 1e-9) g.text("max", x0 + i * bw + bw / 2, base - sy(b.load) - 8, { size: 12, color: "bad", align: "center", weight: 600 });
+    });
+    g.line(x0, base - sy(r.mean), x1, base - sy(r.mean), { color: "ink", dash: [6, 5], lw: 1.5 });
+    g.text("mean", x1, base - sy(r.mean) - 6, { size: 12, color: "ink", align: "right" });
+    g.text("GPU", x0 - 8, base + 18, { size: 12, color: "ink-3", align: "right" });
+    g.text("red outline = replica of a hot expert", x1, 40, { size: 13, color: "bad", align: "right" });
+  }, { controls: "eplb-ctl", format: (id, v) => id === "skew" ? v.toFixed(1) : String(v) });
+})();
+
+</script>
+<script>AtlasAlts.render("alts-parallelism", "sources-parallelism", "parallelism");</script>
+</body>
+</html>

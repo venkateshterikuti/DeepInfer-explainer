@@ -1,0 +1,410 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>DeepInfer Annotated</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&display=swap">
+<link rel="stylesheet" href="atlas.css">
+<header class="bar">
+  <div class="wrap">
+    <a class="brand" href="index.html"><b>DeepInfer</b><span>annotated</span></a>
+    <nav aria-label="Chapters">
+      <a class="num" href="loop.html" title="The generation loop">01</a>
+      <a class="num" href="model.html" title="The model it serves">02</a>
+      <a class="num" href="engine.html" title="Anatomy of the engine">03</a>
+      <a class="num" href="memory.html" title="KV memory">04</a>
+      <a class="num" href="scheduling.html" title="Scheduling a step">05</a>
+      <a class="num" href="parallelism.html" title="One model, many GPUs">06</a>
+      <a class="num" href="cluster.html" title="The cluster around it">07</a>
+      <a class="num" href="replay.html" title="Bounded replay">08</a>
+      <a class="num" href="speculation.html" title="Speculative decoding">09</a>
+      <a class="num" href="kernels.html" title="Numbers and kernels">10</a>
+      <a class="num" href="sampling.html" title="Sampling, structure, determinism">11</a>
+      <a class="num" href="frontdoor.html" title="The front door">12</a>
+      <a class="num" href="measure.html" title="Measuring it">13</a>
+      <a href="index.html" aria-current="page">Map</a>
+    </nav>
+  </div>
+  <div class="progress"></div>
+</header>
+<main>
+  <section class="hero hub-hero">
+    <div class="wrap">
+      <div class="hub-title">
+        <span class="eyebrow">An illustrated field guide · 13 chapters</span>
+        <h1>DeepInfer, <em>annotated</em></h1>
+        <p class="dek">DeepSeek's open-source inference engine, the one behind V4.1 Flash, taken apart from first principles. Each chapter explains one idea, shows how DeepInfer builds it, lets you play with it, and sets it beside how others do the same job.</p>
+        <div class="files">
+          <a class="tag" href="https://github.com/deepseek-ai/DeepInfer" target="_blank" rel="noopener">deepseek-ai/DeepInfer</a>
+          <a class="tag" href="https://github.com/deepseek-ai/DeepInfer/blob/main/doc/inference_deployment_qa.md" target="_blank" rel="noopener">deployment Q&amp;A</a>
+          <a class="tag" href="https://github.com/deepseek-ai/deepseek-recipe" target="_blank" rel="noopener">deepseek-recipe</a>
+        </div>
+      </div>
+      <div class="board wide" data-stage="system" data-label="The whole serving system: a client request passes through Recipe, vision encoders and a prefill tier backed by a KV store, then to a wide expert-parallel decode tier, and tokens stream back. Numbered markers show where each chapter lives.">
+        <span class="ruler">the whole machine · numbers = chapters</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="section hub-read">
+    <div class="wrap">
+      <div class="legend-row">
+        <span class="k-label">How to read the drawings</span>
+        <span class="tag t-compute"><i></i>compute</span>
+        <span class="tag t-memory"><i></i>memory, KV, scales</span>
+        <span class="tag t-net"><i></i>network, images</span>
+        <span class="tag t-cpu"><i></i>CPU, drafts</span>
+        <span class="tag t-ok"><i></i>accepted, kept</span>
+        <span class="tag t-bad"><i></i>rejected, wasted</span>
+        <span class="tag"><i class="dash"></i>dashed: production only, not in the release</span>
+      </div>
+      <p class="note">Scroll-driven diagrams finish each scene when you stop; every lab runs locally. Numbers marked "illustrative" are there to show a shape, not to report a measurement. Everything else comes from the repository, its deployment Q&amp;A or the cited papers.</p>
+    </div>
+  </section>
+
+  <section class="section" id="chapters">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">The chapters</span>
+        <h2>From one token to a fleet</h2>
+        <p class="lede">Read in order for the full story, or jump to the part you need. The first two chapters set up everything else.</p>
+      </header>
+      <div class="chapters">
+        <a class="chap" href="loop.html"><div class="glyph" data-stage="g01" data-label="A token travelling around a loop and dropping onto a growing row."></div><div class="txt"><span class="num">01 · Foundations</span><h3>The generation loop</h3><p>One token per step, why decode is memory-bound, KV caching and continuous batching.</p></div></a>
+        <a class="chap" href="model.html"><div class="glyph" data-stage="g02" data-label="A stack of forty layers with a few experts lighting up per token."></div><div class="txt"><span class="num">02 · Foundations</span><h3>The model it serves</h3><p>V4.1 Flash: sliding windows, compressed sparse attention, shared KV, 384 experts, Engram.</p></div></a>
+        <a class="chap" href="engine.html"><div class="glyph" data-stage="g03" data-label="A Python engine broadcasting to worker processes through a ring buffer."></div><div class="txt"><span class="num">03 · Engine</span><h3>Anatomy of the engine</h3><p>Python front, C++ core, worker processes, engine types and the life of a request.</p></div></a>
+        <a class="chap" href="memory.html"><div class="glyph" data-stage="g04" data-label="A grid of KV blocks filling and freeing as requests come and go."></div><div class="txt"><span class="num">04 · Engine</span><h3>KV memory</h3><p>128-token pages, ref counts, forks, preemption, and a state slot per sequence.</p></div></a>
+        <a class="chap" href="scheduling.html"><div class="glyph" data-stage="g05" data-label="CPU scheduling bars hidden under GPU step bars."></div><div class="txt"><span class="num">05 · Engine</span><h3>Scheduling a step</h3><p>Chunked prefill under a time budget, decode batches, CUDA graphs, zero-overhead scheduling.</p></div></a>
+        <a class="chap" href="parallelism.html"><div class="glyph" data-stage="g06" data-label="An eight by eight grid of GPUs exchanging tokens all-to-all."></div><div class="txt"><span class="num">06 · Scale</span><h3>One model, many GPUs</h3><p>Data-parallel attention, expert parallelism, all-to-all, and expert load balancing.</p></div></a>
+        <a class="chap" href="cluster.html"><div class="glyph" data-stage="g07" data-label="Three tiers, encode, prefill and decode, with requests flowing between them."></div><div class="txt"><span class="num">07 · Scale</span><h3>The cluster around it</h3><p>Disaggregated E/P/D, load balancers, the KV store on 3FS, autoscaling and failover.</p></div></a>
+        <a class="chap" href="replay.html"><div class="glyph" data-stage="g08" data-label="An attention mask band whose early part is clipped."></div><div class="txt"><span class="num">08 · Tricks</span><h3>Bounded replay</h3><p>How a cache hit on a sliding-window model is rebuilt from 128 tokens, not thousands.</p></div></a>
+        <a class="chap" href="speculation.html"><div class="glyph" data-stage="g09" data-label="Rows of draft tokens with a cut where verification stops paying."></div><div class="txt"><span class="num">09 · Tricks</span><h3>Speculative decoding</h3><p>Draft and verify, DSpark's block drafter, and confidence-scheduled verification.</p></div></a>
+        <a class="chap" href="kernels.html"><div class="glyph" data-stage="g10" data-label="Values snapping to the few levels a 4-bit number can hold."></div><div class="txt"><span class="num">10 · Silicon</span><h3>Numbers and kernels</h3><p>FP8 and FP4 with shared scales, DeepSeek's kernel libraries, NVIDIA and Ascend.</p></div></a>
+        <a class="chap" href="sampling.html"><div class="glyph" data-stage="g11" data-label="A probability distribution with a marker picking one token."></div><div class="txt"><span class="num">11 · Output</span><h3>Sampling, structure, determinism</h3><p>The fused sampler, grammar masks with drafts, batch invariance and seeded draws.</p></div></a>
+        <a class="chap" href="frontdoor.html"><div class="glyph" data-stage="g12" data-label="A JSON request turning into a row of token IDs."></div><div class="txt"><span class="num">12 · Output</span><h3>The front door</h3><p>API to tokens and back: safe special tokens, streaming parsing, images as tokens.</p></div></a>
+        <a class="chap" href="measure.html"><div class="glyph" data-stage="g13" data-label="Step-time bars with a playhead measuring steady state."></div><div class="txt"><span class="num">13 · Proof</span><h3>Measuring it</h3><p>How the benchmark avoids fooling itself, the published curves, and correctness tests.</p></div></a>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="journey">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">The journey of one request</span>
+        <h2>Follow a single question through the machine</h2>
+        <p class="lede">Every chapter is a stop on this route. Links go to the chapter that explains each step.</p>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">1 · Arrive</span><h4>JSON becomes token IDs</h4><p>A Chat Completions call arrives. Recipe converts it to a conversation, renders the V4.1 prompt and encodes it, with control tokens placed by position so user text can't forge them.</p><p class="go"><a href="frontdoor.html#encode">12 The front door →</a></p></div></div>
+          <div class="beat"><div class="card"><span class="k">2 · Images</span><h4>Pictures become tokens</h4><p>Each image placeholder expands into rows of 42-pixel tokens. In production a separate vision-encoder GPU turns pixels into embeddings for the prefill tier.</p><p class="go"><a href="frontdoor.html#vision">12 The front door →</a></p></div></div>
+          <div class="beat"><div class="card"><span class="k">3 · Reuse</span><h4>Skip what's already computed</h4><p>The prompt's prefix is looked up in the KV store. Block KV says how much hit; the saved sliding-window state decides whether the last 128 tokens must be recomputed, and bounded replay keeps that recompute short.</p><p class="go"><a href="cluster.html">07 The cluster →</a> <a href="replay.html">08 Bounded replay →</a></p></div></div>
+          <div class="beat"><div class="card"><span class="k">4 · Prefill</span><h4>Read the rest of the prompt</h4><p>A prefill engine at EP2–8 pushes the uncached tokens through the first 20 layers in chunks (a token cap in the release, a time budget in production), replays only the last 140 tokens through the 20 layers that take their KV from earlier ones, and writes KV pages and a window-state slot as it goes.</p><p class="go"><a href="scheduling.html#prefill">05 Scheduling →</a> <a href="model.html">02 The model →</a> <a href="engine.html">03 The engine →</a></p></div></div>
+          <div class="beat"><div class="card"><span class="k">5 · Hand-off</span><h4>Move to a wide decode tier</h4><p>The request's KV moves to a decode instance spread over 64–128 GPUs, where attention runs data-parallel and experts are spread out and rebalanced as traffic shifts.</p><p class="go"><a href="parallelism.html">06 Parallelism →</a> <a href="memory.html">04 KV memory →</a></p></div></div>
+          <div class="beat"><div class="card"><span class="k">6 · Decode</span><h4>Step after step</h4><p>Each step a drafter proposes 5 tokens, the scheduler decides which are worth checking, FP8/FP4 kernels run the model, and the sampler accepts, resamples or masks by grammar, while the CPU is already preparing the next step.</p><p class="go"><a href="loop.html">01 →</a> <a href="speculation.html">09 →</a> <a href="kernels.html">10 →</a> <a href="sampling.html">11 →</a></p></div></div>
+          <div class="beat"><div class="card"><span class="k">7 · Return</span><h4>Tokens become events</h4><p>Token IDs stream back; Recipe buffers split characters, switches between reasoning, text and tool calls on special IDs, and streams tool arguments as JSON. Benchmarks and exact baselines keep all of it honest.</p><p class="go"><a href="frontdoor.html#stream">12 →</a> <a href="measure.html">13 Measuring it →</a></p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="journey" data-label="The serving system with the part relevant to the current step highlighted and a single request moving through it."><span class="ruler">one request</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section hub-close">
+    <div class="wrap">
+      <div class="facts">
+        <div><b>155 T</b><span>tokens a day through one production cluster</span></div>
+        <div><b>40</b><span>layers in V4.1 Flash, 384 routed experts, 6 per token</span></div>
+        <div><b>64–128</b><span>GPUs in one decode instance</span></div>
+        <div><b>2</b><span>hardware platforms from one tree: NVIDIA SM100 and Ascend 950</span></div>
+      </div>
+      <p class="note">Built from the DeepInfer repository and its deployment Q&amp;A, the DSpark paper and deepseek-recipe. The release covers offline inference; the KV store, load balancers and disaggregated deployment are described from DeepSeek's documentation and drawn dashed. Comparisons cite public sources on each chapter page.</p>
+      <a class="start" href="loop.html">Start with chapter 01 →</a>
+    </div>
+  </section>
+
+</main>
+<script src="atlas.js"></script>
+<script>
+(function () {
+  const { ramp, ease, clamp, lerp, rng } = Atlas;
+
+  /* ================= the whole machine ================= */
+  function layout(W, H) {
+    const tall = H > W * 0.95;
+    const F = tall
+      ? { client: [0.04, 0.07, 0.38, 0.09], recipe: [0.56, 0.07, 0.4, 0.09], ve: [0.04, 0.22, 0.36, 0.13], prefill: [0.46, 0.22, 0.44, 0.25], kv: [0.04, 0.39, 0.36, 0.08], decode: [0.04, 0.55, 0.86, 0.42] }
+      : { client: [0.02, 0.40, 0.1, 0.2], recipe: [0.15, 0.3, 0.12, 0.4], ve: [0.32, 0.06, 0.19, 0.19], prefill: [0.32, 0.32, 0.19, 0.36], kv: [0.32, 0.77, 0.19, 0.14], decode: [0.59, 0.1, 0.38, 0.78] };
+    const R = {};
+    Object.keys(F).forEach((k) => { const [x, y, w, h] = F[k]; R[k] = { x: x * W, y: y * H, w: w * W, h: h * H }; });
+    const c = (r) => [r.x + r.w / 2, r.y + r.h / 2], L = (r, f = 0.5) => [r.x, r.y + r.h * f], Rt = (r, f = 0.5) => [r.x + r.w, r.y + r.h * f], T = (r, f = 0.5) => [r.x + r.w * f, r.y], B = (r, f = 0.5) => [r.x + r.w * f, r.y + r.h];
+    const q = (a, b, ctrl) => [a, ctrl || [b[0], a[1]], b];
+    let P;
+    if (!tall) {
+      P = {
+        in: q(Rt(R.client, 0.35), L(R.recipe, 0.3), [(R.client.x + R.client.w + R.recipe.x) / 2, R.client.y + R.client.h * 0.35]),
+        img: q(Rt(R.recipe, 0.12), L(R.ve, 0.6)),
+        ids: q(Rt(R.recipe, 0.45), L(R.prefill, 0.45), [(R.recipe.x + R.recipe.w + R.prefill.x) / 2, R.recipe.y + R.recipe.h * 0.45]),
+        emb: q(B(R.ve, 0.5), T(R.prefill, 0.5), [R.ve.x + R.ve.w / 2, (R.ve.y + R.ve.h + R.prefill.y) / 2]),
+        kv: q(B(R.prefill, 0.5), T(R.kv, 0.5), [R.prefill.x + R.prefill.w / 2, (R.prefill.y + R.prefill.h + R.kv.y) / 2]),
+        hand: q(Rt(R.prefill, 0.5), L(R.decode, 0.5), [(R.prefill.x + R.prefill.w + R.decode.x) / 2, R.prefill.y + R.prefill.h * 0.5]),
+        back: q(B(R.decode, 0.3), B(R.recipe, 0.5), [R.decode.x + R.decode.w * 0.1, H * 1.06]),
+        out: q(L(R.recipe, 0.75), Rt(R.client, 0.7), [(R.client.x + R.client.w + R.recipe.x) / 2, R.recipe.y + R.recipe.h * 0.75]),
+      };
+    } else {
+      P = {
+        in: q(Rt(R.client, 0.4), L(R.recipe, 0.4), [(R.client.x + R.client.w + R.recipe.x) / 2, R.client.y + R.client.h * 0.4]),
+        img: q(B(R.recipe, 0.2), Rt(R.ve, 0.3), [R.recipe.x + R.recipe.w * 0.2, R.ve.y + R.ve.h * 0.3]),
+        ids: q(B(R.recipe, 0.6), T(R.prefill, 0.6), [R.recipe.x + R.recipe.w * 0.6, (R.recipe.y + R.recipe.h + R.prefill.y) / 2]),
+        emb: q(Rt(R.ve, 0.75), L(R.prefill, 0.55), [(R.ve.x + R.ve.w + R.prefill.x) / 2, R.ve.y + R.ve.h * 0.75]),
+        kv: q(L(R.prefill, 0.85), Rt(R.kv, 0.5), [(R.kv.x + R.kv.w + R.prefill.x) / 2, R.prefill.y + R.prefill.h * 0.85]),
+        hand: q(B(R.prefill, 0.5), T(R.decode, 0.73), [R.prefill.x + R.prefill.w * 0.5, (R.prefill.y + R.prefill.h + R.decode.y) / 2]),
+        back: q(Rt(R.decode, 0.1), B(R.recipe, 0.95), [W * 0.975, R.decode.y]),
+        out: q(L(R.recipe, 0.7), Rt(R.client, 0.7), [(R.client.x + R.client.w + R.recipe.x) / 2, R.recipe.y + R.recipe.h * 0.7]),
+      };
+    }
+    return { R, P, tall, c };
+  }
+  const MARK = (R) => ({
+    "01": [R.decode.x + R.decode.w - 2, R.decode.y + 2],
+    "02": [R.prefill.x + R.prefill.w * 0.92, R.prefill.y + R.prefill.h * 0.12],
+    "03": [R.prefill.x + 4, R.prefill.y + R.prefill.h * 0.12],
+    "04": [R.decode.x + R.decode.w - 2, R.decode.y + R.decode.h - 2],
+    "05": [R.prefill.x + R.prefill.w * 0.5, R.prefill.y + R.prefill.h * 0.97],
+    "06": [R.decode.x + R.decode.w * 0.5, R.decode.y + R.decode.h * 0.55],
+    "07": [R.kv.x + R.kv.w * 0.92, R.kv.y + 4],
+    "08": [R.kv.x + 4, R.kv.y + 4],
+    "09": [R.decode.x + 132, R.decode.y + R.decode.h - 23],
+    "10": [R.decode.x + R.decode.w * 0.55, R.decode.y + R.decode.h - 23],
+    "11": [R.decode.x + R.decode.w * 0.75, R.decode.y + R.decode.h - 23],
+    "12": [R.recipe.x + R.recipe.w * 0.5, R.recipe.y + 4],
+    "13": [R.client.x + R.client.w * 0.5, R.client.y + R.client.h + 6],
+  });
+  const LINKS = [["in", "net", false], ["img", "net", true], ["ids", "compute", false], ["emb", "net", true], ["kv", "memory", true], ["hand", "memory", true], ["back", "ok", false], ["out", "ok", false]];
+
+  function drawSystem(g, s, focus) {
+    const { W, H } = g;
+    const { R, P, tall } = layout(W, H);
+    const t = s.t;
+    const F = focus || null;
+    const on = (k) => (!F ? 1 : F.nodes.includes(k) ? 1 : 0.22);
+    const lon = (k) => (!F ? 1 : F.links.includes(k) ? 1 : 0.15);
+    // links under nodes
+    LINKS.forEach(([k, c, dashed]) => {
+      const [p0, p1, p2] = P[k], a = lon(k);
+      g.curve(p0, p1, p2, { color: c, lw: 1.8, head: 9, dash: dashed ? [6, 5] : null, a: 0.75 * a });
+      const n = 3, sp = k === "back" || k === "out" ? 0.32 : 0.42;
+      for (let i = 0; i < n; i++) {
+        const u = (t * sp + i / n + (k.length * 0.13)) % 1;
+        const [x, y] = g.bez(p0, p1, p2, u);
+        g.circle(x, y, 3.6, { fill: c, a: a * Math.sin(Math.PI * u) * 0.95 });
+      }
+    });
+    const fs = tall ? 13 : 14;
+    // client
+    const r0 = R.client;
+    g.box(r0.x, r0.y, r0.w, r0.h, { color: "ink-3", wash: 0.05, a: on("client") });
+    g.text("client", r0.x + 10, r0.y + 22, { size: fs + 2, font: "display", weight: 800, color: "ink", a: on("client") });
+    g.text("{ API }", r0.x + 10, r0.y + 42, { size: 11, color: "ink-3", a: on("client") });
+    // recipe
+    const r1 = R.recipe;
+    g.box(r1.x, r1.y, r1.w, r1.h, { color: "net", a: on("recipe") });
+    g.text("Recipe", r1.x + 10, r1.y + 24, { size: fs + 4, font: "display", weight: 800, color: "ink", a: on("recipe") });
+    if (!tall) { g.text("encode", r1.x + 10, r1.y + 44, { size: 11, color: "ink-2", a: on("recipe") }); g.text("parse", r1.x + 10, r1.y + r1.h - 14, { size: 11, color: "ink-2", a: on("recipe") }); }
+    else g.text("encode · parse", r1.x + 10, r1.y + 42, { size: 11, color: "ink-2", a: on("recipe") });
+    // vision encoders
+    const r2 = R.ve;
+    g.box(r2.x, r2.y, r2.w, r2.h, { color: "net", dash: [6, 5], wash: 0.06, a: on("ve") });
+    g.text("vision encoders", r2.x + 10, r2.y + 20, { size: 12, color: "net", weight: 600, a: on("ve") });
+    const vs = Math.min(18, (r2.w - 30) / 4.6);
+    for (let i = 0; i < 4; i++) { const busy = 0.3 + 0.6 * (0.5 + 0.5 * Math.sin(t * 2 + i * 1.7)); g.rect(r2.x + 10 + i * (vs + 6), r2.y + r2.h - vs - 10, vs, vs, { fill: "net", r: 3, a: on("ve") * busy }); }
+    // prefill
+    const r3 = R.prefill;
+    g.box(r3.x, r3.y, r3.w, r3.h, { color: "compute", wash: 0.05, a: on("prefill") });
+    g.text("prefill", r3.x + 26, r3.y + 22, { size: fs + 2, font: "display", weight: 800, color: "ink", a: on("prefill") });
+    const ih = (r3.h - 44) / 3;
+    for (let k = 0; k < 3; k++) {
+      const y = r3.y + 32 + k * ih;
+      g.rect(r3.x + 10, y + 3, r3.w - 20, ih - 8, { stroke: "compute", lw: 1, r: 5, a: on("prefill") * 0.7 });
+      const sq = Math.min(14, (ih - 14));
+      for (let j = 0; j < 4; j++) { const ph = (t * 1.3 + k * 0.4 + j * 0.15) % 1; g.rect(r3.x + 18 + j * (sq + 5), y + (ih - 8) / 2 + 3 - sq / 2, sq, sq, { fill: "compute", r: 2, a: on("prefill") * (0.35 + 0.55 * (ph < 0.5 ? 1 : 0.4)) }); }
+      if (r3.w > 150) g.text("EP4", r3.x + r3.w - 18, y + (ih - 8) / 2 + 7, { size: 11, color: "compute", align: "right", a: on("prefill") });
+    }
+    // kv store
+    const r4 = R.kv;
+    g.box(r4.x, r4.y, r4.w, r4.h, { color: "memory", dash: [6, 5], wash: 0.07, a: on("kv") });
+    g.text("KV store · 3FS", r4.x + 30, r4.y + r4.h / 2 + 5, { size: 12, color: "memory", weight: 600, a: on("kv") });
+    // decode
+    const r5 = R.decode;
+    g.box(r5.x, r5.y, r5.w, r5.h, { color: "compute", wash: 0.05, a: on("decode") });
+    g.text("decode · wide EP", r5.x + 14, r5.y + 26, { size: fs + 4, font: "display", weight: 800, color: "ink", a: on("decode") });
+    const cols = 8, rows = 8, gx0 = r5.x + 16, gy0 = r5.y + 42, gw = r5.w - 32, gh = r5.h - 84;
+    const cw = gw / cols, ch = gh / rows;
+    const wave = (t * 0.7) % 1;
+    for (let i = 0; i < rows; i++) for (let j = 0; j < cols; j++) {
+      const d = Math.abs(((i + j) / 14) - wave), act = Math.max(0, 1 - d * 6);
+      g.rect(gx0 + j * cw + 2, gy0 + i * ch + 2, cw - 4, ch - 4, { fill: "compute", r: 3, a: on("decode") * (0.16 + 0.6 * act) });
+      // tiny kv pages
+      g.rect(gx0 + j * cw + 5, gy0 + i * ch + ch - 8, (cw - 10) * (0.3 + 0.6 * ((i * 7 + j * 3) % 10) / 10), 3, { fill: "memory", r: 1, a: on("decode") * 0.7 });
+    }
+    g.text("64 GPUs · one instance", r5.x + r5.w - 24, r5.y + 26, { size: 11, color: "ink-3", align: "right", a: on("decode") });
+    // drafts strip
+    const dy = r5.y + r5.h - 20;
+    for (let k = 0; k < 6; k++) g.rect(r5.x + 16 + k * 16, dy - 8, 12, 10, { fill: k === 0 ? "compute" : "cpu", r: 2, a: on("decode") * (k === 0 ? 0.9 : 0.4 + 0.5 * ((t * 2 + k * 0.3) % 1 > 0.5 ? 1 : 0)) });
+    // markers
+    const M = MARK(R);
+    Object.keys(M).forEach((k, idx) => {
+      const show = !F ? 1 : F.marks.includes(k) ? 1 : 0;
+      if (show <= 0) return;
+      const [x, y] = M[k];
+      const pulse = !F ? 0.5 + 0.5 * Math.max(0, Math.sin(t * 1.4 - idx * 0.48)) : 1;
+      g.circle(x, y, 13, { fill: "sheet", stroke: "ink", lw: 1.6, a: 0.95 });
+      g.circle(x, y, 13 + 6 * pulse, { stroke: "compute", lw: 1.2, a: (1 - pulse) * 0.6 * (F ? 0 : 1) });
+      g.text(k, x, y + 4.5, { size: 11, color: "ink", align: "center", weight: 700 });
+    });
+    return { R, P };
+  }
+
+  Atlas.scene("system", (g, s) => { drawSystem(g, s, null); }, { anim: true, restT: 3, zoom: 1.1, maxW: 1200 });
+
+  const BEATS = [
+    { nodes: ["client", "recipe"], links: ["in"], marks: ["12"], path: "in" },
+    { nodes: ["recipe", "ve", "prefill"], links: ["img", "emb"], marks: ["12"], path: "emb" },
+    { nodes: ["kv", "prefill"], links: ["kv"], marks: ["07", "08"], path: "kv" },
+    { nodes: ["prefill", "recipe"], links: ["ids"], marks: ["02", "03", "05"], path: "ids" },
+    { nodes: ["prefill", "decode"], links: ["hand"], marks: ["04", "06"], path: "hand" },
+    { nodes: ["decode"], links: [], marks: ["01", "09", "10", "11"], path: null },
+    { nodes: ["decode", "recipe", "client"], links: ["back", "out"], marks: ["12", "13"], path: "back" },
+  ];
+  Atlas.scene("journey", (g, s) => {
+    const i = clamp(Math.round(s.b), 0, BEATS.length - 1);
+    const F = BEATS[i];
+    const { R, P } = drawSystem(g, s, F);
+    // the request itself
+    const u = ease(clamp(((s.t % 3.2) - 0.2) / 2.2));
+    let pos;
+    if (F.path) { const [p0, p1, p2] = P[F.path]; pos = g.bez(p0, p1, p2, u); }
+    else { const r = R.decode, a = s.t * 1.6; pos = [r.x + r.w / 2 + Math.cos(a) * r.w * 0.28, r.y + r.h * 0.5 + Math.sin(a) * r.h * 0.26]; }
+    g.circle(pos[0], pos[1], 13, { fill: "memory", a: 0.25 });
+    g.circle(pos[0], pos[1], 7, { fill: "memory", stroke: "sheet", lw: 2 });
+  }, { anim: true, restT: 2.4 });
+
+  /* ================= chapter glyphs ================= */
+  const G = { anim: true, restT: 2, zoom: 1.15, minW: 300, maxW: 460 };
+  Atlas.scene("g01", (g, s) => {
+    const { W, H } = g, cx = W * 0.3, cy = H * 0.5, r = H * 0.26, a = s.t * 1.6;
+    g.circle(cx, cy, r, { stroke: "hair", lw: 2 });
+    ["forward", "sample", "append"].forEach((l, k) => { const an = -Math.PI / 2 + k * 2.09; g.text(l, cx + Math.cos(an) * (r + 18), cy + Math.sin(an) * (r + 18) + 4, { size: 11, color: "ink-3", align: "center" }); });
+    g.circle(cx + Math.cos(a) * r, cy + Math.sin(a) * r, 7, { fill: "compute" });
+    const n = Math.floor(s.t * 1.6 / (Math.PI * 2)) % 8 + 3;
+    for (let k = 0; k < 10; k++) g.rect(W * 0.58 + k * ((W * 0.38) / 10), cy - 10, (W * 0.38) / 10 - 4, 20, { fill: k < n ? "compute" : "hair", r: 3, a: k < n ? 0.3 + 0.07 * k : 0.6 });
+  }, G);
+  Atlas.scene("g02", (g, s) => {
+    const { W, H } = g, L = 40, x0 = 24, lw = (W * 0.42 - x0) , lh = (H - 40) / L;
+    for (let l = 0; l < L; l++) { const y = H - 20 - (l + 1) * lh; g.rect(x0, y, lw, lh - 1.2, { fill: l % 2 ? "compute" : "net", r: 1, a: 0.25 + 0.35 * (Math.floor(s.t * 8) % L === l ? 1 : 0) }); }
+    const ex = W * 0.52, cols = 16, rows = 8, cs = Math.min((W - ex - 20) / cols, (H - 40) / rows);
+    const R = rng(Math.floor(s.t * 2) + 1), hot = new Set(); while (hot.size < 6) hot.add(Math.floor(R() * 128));
+    for (let i = 0; i < 128; i++) g.rect(ex + (i % cols) * cs, 20 + Math.floor(i / cols) * cs, cs - 2, cs - 2, { fill: hot.has(i) ? "memory" : "hair", r: 2, a: hot.has(i) ? 0.9 : 0.7 });
+    g.text("6 of 384 experts", ex, H - 8, { size: 11, color: "memory", weight: 600 });
+  }, G);
+  Atlas.scene("g03", (g, s) => {
+    const { W, H } = g;
+    g.box(20, H * 0.38, W * 0.26, H * 0.24, { color: "cpu", title: "engine", tsize: 14, tfont: "mono", tweight: 600 });
+    const cx = W * 0.5, cy = H * 0.5, r = H * 0.16;
+    g.circle(cx, cy, r, { stroke: "memory", lw: 6, a: 0.35 });
+    const a = s.t * 2; g.circle(cx + Math.cos(a) * r, cy + Math.sin(a) * r, 6, { fill: "memory" });
+    for (let k = 0; k < 4; k++) { const y = 20 + k * (H - 40) / 4; g.rect(W * 0.72, y + 4, W * 0.24, (H - 40) / 4 - 10, { fill: "compute", r: 4, a: 0.25 + 0.5 * ((s.t * 1.5 + k * 0.25) % 1 > 0.5 ? 1 : 0) }); }
+    g.arrow(20 + W * 0.26 + 4, cy, cx - r - 8, cy, { color: "ink-3", lw: 1.4, head: 7 });
+    g.arrow(cx + r + 8, cy, W * 0.72 - 6, cy, { color: "ink-3", lw: 1.4, head: 7 });
+  }, G);
+  Atlas.scene("g04", (g, s) => {
+    const { W, H } = g, cols = 16, rows = 7, cs = Math.min((W - 40) / cols, (H - 30) / rows);
+    const cols4 = ["compute", "memory", "net", "cpu"];
+    for (let i = 0; i < cols * rows; i++) {
+      const R = rng(i + 1), owner = Math.floor(R() * 5), life = (s.t * 0.25 + R()) % 1;
+      const used = owner < 4 && life < 0.75;
+      g.rect(20 + (i % cols) * cs, 15 + Math.floor(i / cols) * cs, cs - 3, cs - 3, { fill: used ? cols4[owner] : "hair", r: 2, a: used ? 0.75 : 0.5 });
+    }
+  }, G);
+  Atlas.scene("g05", (g, s) => {
+    const { W, H } = g, x0 = 20, x1 = W - 20, n = 6, sw = (x1 - x0) / n;
+    g.text("GPU", x0, H * 0.3 - 8, { size: 10, color: "ink-3" }); g.text("CPU", x0, H * 0.62 - 8, { size: 10, color: "ink-3" });
+    const off = (s.t * 0.6) % 1;
+    for (let k = -1; k < n; k++) {
+      const x = x0 + (k + off) * sw; if (x > x1 || x + sw < x0) continue;
+      g.rect(Math.max(x0, x + 2), H * 0.3, Math.min(sw - 4, x1 - x), H * 0.18, { fill: "compute", r: 3, a: 0.75 });
+      g.rect(Math.max(x0, x + sw * 0.15), H * 0.62, Math.min(sw * 0.6, x1 - x - sw * 0.15), H * 0.14, { fill: "cpu", r: 3, a: 0.6 });
+    }
+    g.text("CPU work hidden under GPU steps", x0, H - 12, { size: 11, color: "ink-2" });
+  }, G);
+  Atlas.scene("g06", (g, s) => {
+    const { W, H } = g, n = 8, cs = Math.min((W - 40) / n, (H - 30) / n), x0 = (W - cs * n) / 2, y0 = (H - cs * n) / 2;
+    const ctr = (i) => [x0 + (i % n) * cs + cs / 2, y0 + Math.floor(i / n) * cs + cs / 2];
+    const R = rng(Math.floor(s.t * 1.5) + 3);
+    for (let k = 0; k < 10; k++) { const a = Math.floor(R() * 64), b = Math.floor(R() * 64); const [ax, ay] = ctr(a), [bx, by] = ctr(b); g.line(ax, ay, bx, by, { color: "net", lw: 1.2, a: 0.5 }); }
+    for (let i = 0; i < 64; i++) { const [x, y] = ctr(i); g.rect(x - cs / 2 + 2, y - cs / 2 + 2, cs - 4, cs - 4, { fill: "compute", r: 3, a: 0.25 + 0.2 * ((i + Math.floor(s.t * 3)) % 7 === 0 ? 2 : 0) }); }
+  }, G);
+  Atlas.scene("g07", (g, s) => {
+    const { W, H } = g, cols = [["E", "net", 2], ["P", "compute", 3], ["D", "compute", 1]];
+    const cw = (W - 60) / 3;
+    cols.forEach(([l, c, n], k) => {
+      const x = 20 + k * (cw + 10);
+      g.text(l, x + cw / 2, 26, { size: 16, font: "display", weight: 800, color: c, align: "center" });
+      for (let i = 0; i < n; i++) { const hh = (H - 70) / n; g.rect(x, 40 + i * hh, cw, hh - 6, { stroke: c, lw: 1.5, r: 5, dash: k === 0 ? [4, 3] : null }); }
+    });
+    for (let k = 0; k < 5; k++) { const u = (s.t * 0.4 + k / 5) % 1; g.circle(lerp(20 + cw / 2, 20 + 2 * (cw + 10) + cw / 2, u), 40 + (H - 70) * (0.2 + 0.6 * ((k * 0.37) % 1)), 4, { fill: "memory", a: Math.sin(Math.PI * u) }); }
+  }, G);
+  Atlas.scene("g08", (g, s) => {
+    const { W, H } = g, n = 16, w = 4, size = Math.min(H - 30, W * 0.6), cs = size / n, x0 = (W - size) / 2, y0 = 15;
+    const sv = 4 + Math.floor(((Math.sin(s.t * 0.7) + 1) / 2) * 9);
+    for (let i = 0; i < n; i++) for (let j = 0; j <= i; j++) {
+      const inWin = j >= i - w + 1; let fill = "hair", a = 0.6, stroke = null;
+      if (i < sv) { if (inWin) { fill = "compute"; a = 0.4; } } else if (inWin) { if (j >= sv) { fill = "ok"; a = 0.85; } else { fill = null; stroke = "bad"; } }
+      g.rect(x0 + j * cs + 1, y0 + i * cs + 1, cs - 2, cs - 2, { fill, stroke, lw: 1.2, r: 2, a });
+    }
+  }, G);
+  Atlas.scene("g09", (g, s) => {
+    const { W, H } = g, rows = 5, rh = (H - 30) / rows, cw = (W - 80) / 6;
+    const R = rng(7);
+    for (let i = 0; i < rows; i++) {
+      const k = 1 + Math.floor(R() * 5), y = 15 + i * rh;
+      for (let j = 0; j < 6; j++) {
+        const adm = j <= k, ph = (s.t * 0.5 + i * 0.1) % 1;
+        g.rect(40 + j * cw, y + 4, cw - 5, rh - 10, { fill: j === 0 ? "compute" : adm ? (ph > 0.5 && j === k ? "bad" : "ok") : "cpu", r: 3, a: adm ? 0.75 : 0.18 });
+      }
+      g.line(40 + (k + 1) * cw - 3, y, 40 + (k + 1) * cw - 3, y + rh - 2, { color: "ink", lw: 2 });
+    }
+  }, G);
+  Atlas.scene("g10", (g, s) => {
+    const { W, H } = g, x0 = 24, x1 = W - 24, ly = H - 34, sx = (v) => (x0 + x1) / 2 + v / 6.4 * (x1 - x0) / 2;
+    const lv = [0, 0.5, 1, 1.5, 2, 3, 4, 6]; g.line(x0, ly, x1, ly, { color: "ink-3", lw: 1.2 });
+    lv.forEach((l) => { g.line(sx(l), ly - 5, sx(l), ly + 5, { color: "compute", lw: 2 }); if (l) g.line(sx(-l), ly - 5, sx(-l), ly + 5, { color: "compute", lw: 2 }); });
+    const R = rng(Math.floor(s.t / 4) + 2), ph = ease(clamp(((s.t % 4) - 1) / 1)); const cnt = new Map();
+    for (let i = 0; i < 24; i++) { const v = (R() - 0.5) * 11; let best = 0; [...lv, ...lv.map((x) => -x)].forEach((l) => { if (Math.abs(v - l) < Math.abs(v - best)) best = l; }); const c = cnt.get(best) || 0; cnt.set(best, c + 1); g.circle(lerp(sx(v), sx(best), ph), lerp(20 + (i % 6) * 14, ly - 12 - c * 12, ph), 5, { fill: "compute", a: 0.8 }); }
+  }, G);
+  Atlas.scene("g11", (g, s) => {
+    const { W, H } = g, n = 14, x0 = 24, bw = (W - 48) / n, base = H - 30;
+    const T = 0.8 + 0.4 * Math.sin(s.t * 0.9), ls = Array.from({ length: n }, (_, i) => 3 - i * 0.3);
+    const m = Math.max(...ls), e = ls.map((l) => Math.exp((l - m) / T)), z = e.reduce((a, b) => a + b, 0);
+    const pick = Math.floor((s.t * 0.7) % 4);
+    e.forEach((v, i) => { const h = v / z * (H - 60) * 2.2; g.rect(x0 + i * bw + 2, base - h, bw - 4, h, { fill: i === pick ? "ok" : i > 9 ? "ink-3" : "compute", r: 2, a: i > 9 ? 0.25 : 0.8 }); });
+    g.line(x0, base, W - 24, base, { color: "ink-3", lw: 1 });
+    g.head(x0 + pick * bw + bw / 2, base + 14, -Math.PI / 2, { color: "ink", size: 9 });
+  }, G);
+  Atlas.scene("g12", (g, s) => {
+    const { W, H } = g, ph = (s.t * 0.5) % 1;
+    g.text("{ \"messages\": [ … ] }", 24, H * 0.32, { size: 14, color: "ink-2", weight: 600 });
+    const n = 12, cw = (W - 48) / n;
+    for (let i = 0; i < n; i++) { const sp = i === 0 || i === 1 || i === 9; const p = clamp(ph * n * 1.4 - i); g.rect(24 + i * cw, H * 0.55, cw - 4, 22, { fill: sp ? "memory" : "compute", r: 3, a: (sp ? 0.85 : 0.45) * p }); }
+    g.text("special IDs by position", 24, H * 0.55 + 46, { size: 11, color: "memory" });
+  }, G);
+  Atlas.scene("g13", (g, s) => {
+    const { W, H } = g, n = 30, x0 = 20, bw = (W - 40) / n, base = H - 24, R = rng(5);
+    const head = ((s.t * 6) % (n + 8));
+    for (let i = 0; i < n; i++) { if (i > head) break; const fl = i % 9 === 6, h = (H - 70) * (0.62 + R() * 0.06 + (fl ? 0.3 : 0)); if (fl) g.hatch(x0 + i * bw + 1, base - h, bw - 3, h, { color: "bad", r: 1 }); else g.rect(x0 + i * bw + 1, base - h, bw - 3, h, { fill: i < 8 ? "ink-3" : "compute", r: 1, a: i < 8 ? 0.35 : 0.8 }); }
+    g.line(x0, base, W - 20, base, { color: "ink-3", lw: 1 });
+  }, G);
+})();
+
+</script>
+
+</body></html>

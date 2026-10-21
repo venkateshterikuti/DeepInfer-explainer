@@ -1,0 +1,438 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Measuring it · DeepInfer Annotated</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&display=swap">
+<link rel="stylesheet" href="atlas.css">
+</head>
+<body>
+<header class="bar">
+  <div class="wrap">
+    <a class="brand" href="index.html"><b>DeepInfer</b><span>annotated</span></a>
+    <nav aria-label="Chapters">
+      <a class="num" href="loop.html" title="The generation loop">01</a>
+      <a class="num" href="model.html" title="The model it serves">02</a>
+      <a class="num" href="engine.html" title="Anatomy of the engine">03</a>
+      <a class="num" href="memory.html" title="KV memory">04</a>
+      <a class="num" href="scheduling.html" title="Scheduling a step">05</a>
+      <a class="num" href="parallelism.html" title="One model, many GPUs">06</a>
+      <a class="num" href="cluster.html" title="The cluster around it">07</a>
+      <a class="num" href="replay.html" title="Bounded replay">08</a>
+      <a class="num" href="speculation.html" title="Speculative decoding">09</a>
+      <a class="num" href="kernels.html" title="Numbers and kernels">10</a>
+      <a class="num" href="sampling.html" title="Sampling, structure, determinism">11</a>
+      <a class="num" href="frontdoor.html" title="The front door">12</a>
+      <a class="num" href="measure.html" aria-current="page" title="Measuring it">13</a>
+      <a href="index.html">Map</a>
+    </nav>
+  </div>
+  <div class="progress"></div>
+</header>
+<main>
+  <section class="hero">
+    <div class="wrap">
+      <div>
+        <span class="eyebrow"><span class="n">13</span> Proof</span>
+        <h1>Measuring <em>it</em></h1>
+        <p class="dek">A serving engine is only as good as the numbers you can trust about it: how fast it runs, measured so noise can't creep in, and whether it still computes the same thing after every change.</p>
+        <div class="files">
+          <span class="tag">examples/benchmark.py</span>
+          <span class="tag">examples/sweep/</span>
+          <span class="tag">tests/models/</span>
+          <span class="tag">eval/</span>
+        </div>
+      </div>
+      <div class="board stage-card" data-stage="meter" data-label="A strip of decode steps scrolling past: grey warmup steps, measured steps, one spike from a load-balancer flush that gets dropped, and a running average of steps per second.">
+        <span class="ruler">steady-state window</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <div class="facts">
+        <div><b>155 T</b><span>tokens per day served by one production cluster</span></div>
+        <div><b>US$38</b><span>revenue per GPU-hour, at off-peak (valley) pricing</span></div>
+        <div><b>26.3k</b><span>decode tokens/s/GPU at EP64, 256 requests per rank, 128K context, 3 drafts at 75%</span></div>
+        <div><b>89.5k</b><span>non-cached prefill tokens/s/GPU at EP4, 65,536 tokens per step</span></div>
+        <div><b>60</b><span>decode intervals per measurement, minus those hit by a load-balancer flush, after 110 steps of warmup and logging</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="method">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">The benchmark</span>
+        <h2>Measure one stage at a time, in steady state</h2>
+        <p class="lede">The offline benchmark drives the engine directly, with no server or network in the way, and reports per-GPU speed of prefill and decode separately.</p>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">Decoupled stages</span><h4>One prefix, forked many times</h4><p>One source request computes the shared cached prefix (by default 28,672 of a 32,768-token context), then forks into many requests that each prefill their own 4,096-token suffix, in chunks of 32,768 tokens per step. Decode then runs 64 of them per rank. Prompts are random non-special tokens, so no special-token path is hit by accident.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Steady state</span><h4>Skip, log, then measure silently</h4><p>Prefill skips 5 warmup chunks and measures 10 intervals. Decode skips 50 warmup steps, runs 60 more with periodic logging on (load-balance readings are taken there), then measures 60 intervals with logging off.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Noise</span><h4>Drop the flush, profile last</h4><p>Every few steps the MoE load balancer gathers expert statistics across all ranks, which adds about a dozen milliseconds. Intervals containing that flush are dropped. The profiler runs in separate windows at the ends: it inflates step times (by up to half at batch 1), and leaves a 7–11% slowdown after it detaches, so nothing is measured after it.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Accounting</span><h4>Read the token count carefully</h4><p>Decode throughput is steps per second × requests × (1 + drafts) ÷ CP: every draft is counted as accepted. That's an upper bound; the real output depends on acceptance. The published curves instead scale by an assumed acceptance, for example 3 drafts at 75% each counted as 1 + 3 × 0.75 = 3.25 tokens per step.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="method" data-label="A source request's cached prefix forking into many suffixes cut into prefill chunks; a step timeline with warmup, logged and silent measurement segments; step durations with one flush spike dropped and profiler windows at the ends; counted versus delivered tokens per decode step."><span class="ruler">benchmark.py</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="lab">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Try it</span>
+        <h2>Throughput against speed</h2>
+        <p class="lede">DeepSeek's published sweeps for V4.1 Flash at 128K context. Bigger batches raise throughput per GPU and lower speed per user; wide EP moves the whole curve out.</p>
+      </header>
+      <div class="lab">
+        <div class="controls" id="par-ctl">
+          <div class="ctl"><label>Stage</label>
+            <div class="seg" id="pmode"><button type="button" value="decode" aria-pressed="true">decode</button><button type="button" value="prefill" aria-pressed="false">prefill</button></div>
+          </div>
+          <div class="ctl"><label for="ppt">Batch per rank <output for="ppt">64</output></label><input type="range" id="ppt" min="0" max="5" step="1" value="3"></div>
+          <div class="readout">
+            <div><b id="pa-1">–</b><span id="pa-1l">–</span></div>
+            <div><b id="pa-2">–</b><span id="pa-2l">–</span></div>
+          </div>
+          <p class="note" id="pa-note">–</p>
+        </div>
+        <div class="board" data-stage="pareto" data-label="Decode throughput per GPU against per-user speed for EP64 and EP8 at batch sizes 8 to 256, or prefill throughput against step latency for chunk sizes 4,096 to 65,536, with the selected point highlighted."><span class="ruler">published sweep data</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="correct">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Correctness</span>
+        <h2>Is it still computing the same thing?</h2>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">Exact baselines</span><h4>Perplexity, sample by sample</h4><p>Offline inference records per-sample perplexity for fixed text and image prompts, per platform and per DP rank, and compares it exactly against stored baselines. A long variant uses a 16,389-token input and 4,096 outputs with 5 drafts. A baseline is refreshed only after a numeric change has been confirmed as intended.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Invariance tests</span><h4>Same answer, different arrangement</h4><p>Batched versus one-at-a-time must match exactly, for the language model and for the vision encoder. Two logprob passes are compared by KL divergence. The sampler, the EPLB placement policy and nearly every TileLang op have their own tests; the random sampler is checked both statistically and for invariance to row order.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Model quality</span><h4>End-to-end evals</h4><p>AIME 2026 (30 problems × 32 samples), HLE (2,500 questions, 342 with images) and GPQA Diamond (198 × 8), all scored as Pass@1. Generation writes raw outputs to disk and scoring runs separately, so the judge can change without regenerating. Prompts are rendered by the encoder shipped with the checkpoint.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="checks" data-label="Baseline perplexities compared sample by sample with one mismatch failing the run; a grid of invariance tests; three evaluation suites feeding a generate then score pipeline."><span class="ruler">tests/ · eval/</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="code">
+    <div class="wrap stack">
+      <header>
+        <span class="eyebrow">In the repo</span>
+        <h2>Where the decode number comes from</h2>
+      </header>
+      <div class="split">
+        <div class="code">
+          <div class="hd"><span>examples/benchmark.py · measure_decode</span><a href="https://github.com/deepseek-ai/DeepInfer/blob/main/examples/benchmark.py" target="_blank" rel="noopener">source</a></div>
+<pre>clean = [ts - prev[<span class="n">0</span>] <span class="k">for</span> prev, (ts, flushed)
+         <span class="k">in</span> pairwise(stable_decode) <span class="k">if not</span> flushed]
+avg_sps = len(clean) / sum(clean)
+<span class="k">return</span> {
+    <span class="s">"decode_avg_sps"</span>: avg_sps,
+    <span class="s">"decode_max_step_ms"</span>: max(clean) * <span class="n">1000</span>,
+    <span class="c"># full-acceptance accounting: 1 + nextn tokens</span>
+    <span class="c"># per request per step; rescale with τ from avg_sps</span>
+    <span class="s">"decode_tokens_per_s_per_gpu"</span>:
+        avg_sps * args.decode_num_requests
+        * (envs.DEEPINFER_USE_NEXTN_DECODE + <span class="n">1</span>) / cp_size,
+}</pre>
+        </div>
+        <div class="prose">
+          <p><b>Steps per second is the honest quantity.</b> With fixed-length verification each step always submits 1 + drafts tokens per request, so the step rate doesn't depend on acceptance. Token throughput is a choice of how to count, which is why the raw step rate is saved alongside it.</p>
+          <p><b>The slowest step is reported too</b>, and should be close to 1000 ÷ average steps per second. A large gap means something periodic is still inside the window.</p>
+          <p><b>Sweeps are one process per point</b>, always with the profiler off, and refuse to plot points whose model, EP size, context or draft count differ.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="others">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Other ways to do it</span>
+        <h2>How others benchmark serving</h2>
+      </header>
+      <div class="compare" id="alts-measure"></div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap"><div class="sources" id="sources-measure"></div></div>
+  </section>
+
+</main>
+<nav class="next" aria-label="Chapter navigation">
+  <div class="wrap">
+    <a href="frontdoor.html"><span>← Chapter 12</span><b>The front door</b></a>
+    <a class="fwd" href="index.html"><span>Back to the map →</span><b>The whole machine</b></a>
+  </div>
+</nav>
+<script src="atlas.js"></script>
+<script src="alts.js"></script>
+<script>
+(function () {
+  const { ramp, ease, clamp, lerp, rng } = Atlas;
+
+  /* ---------------- hero: steady-state meter ---------------- */
+  Atlas.scene("meter", (g, s) => {
+    const { W, H } = g;
+    const R = rng(12);
+    const NW = 18, NL = 22, NM = 40, N = NW + NL + NM;
+    const dur = []; for (let i = 0; i < N; i++) dur.push(31 + (R() - 0.5) * 2.4 + (i % 10 === 7 ? 12 : 0));
+    const kind = (i) => (i < NW ? 0 : i < NW + NL ? 1 : 2);
+    const cyc = 9, tt = s.t % cyc, head = clamp(tt / 7) * N;
+    const x0 = 30, x1 = W - 30, base = H - 96, bw = (x1 - x0) / N, hs = (H - 230) / 46;
+    let sum = 0, cnt = 0, maxd = 0;
+    for (let i = 0; i < N; i++) {
+      const p = clamp(head - i);
+      if (p <= 0) break;
+      const d = dur[i], kd = kind(i), flush = i % 10 === 7;
+      const x = x0 + i * bw, h = d * hs * ease(p);
+      const c = kd === 0 ? "ink-3" : kd === 1 ? "cpu" : "compute";
+      if (flush && kd === 2) g.hatch(x + 0.5, base - h, bw - 1.5, h, { color: "bad", r: 1 });
+      else g.rect(x + 0.5, base - h, bw - 1.5, h, { fill: c, r: 1, a: kd === 0 ? 0.35 : 0.8 });
+      if (kd === 2 && !flush && p >= 1) { sum += d; cnt++; maxd = Math.max(maxd, d); }
+    }
+    g.line(x0, base, x1, base, { color: "ink-3", lw: 1 });
+    if (head < N) g.line(x0 + head * bw, base - 46 * hs - 10, x0 + head * bw, base + 4, { color: "ink", lw: 1.5, a: 0.6 });
+    // segment brackets
+    [[0, NW, "warmup"], [NW, NW + NL, "logging on"], [NW + NL, N, "measured silently"]].forEach(([a, b, l], k) => {
+      const xa = x0 + a * bw + 2, xb = x0 + b * bw - 2, y = base + 16;
+      g.line(xa, y, xb, y, { color: k === 2 ? "compute" : k === 1 ? "cpu" : "ink-3", lw: 2 });
+      g.text(l, xa, y + 18, { size: 11, color: k === 2 ? "compute" : k === 1 ? "cpu" : "ink-3", weight: 600 });
+    });
+    g.chip(x1, base + 34, "flush: dropped", "bad", { size: 11, align: "right" });
+    const sps = cnt ? 1000 * cnt / sum : 0;
+    if (cnt) g.text(sps.toFixed(1), x1, 70, { size: 44, font: "display", weight: 800, color: "compute", align: "right" });
+    g.text(cnt ? `steps/s · ${cnt} clean intervals · max ${maxd.toFixed(1)} ms` : "not measuring yet", x1, 92, { size: 11, color: "ink-3", align: "right" });
+    g.text("(illustrative)", x1, 108, { size: 10, color: "ink-3", align: "right" });
+  }, { anim: true, restT: 8, zoom: 1.0, minW: 540 });
+
+  /* ---------------- method ---------------- */
+  Atlas.scene("method", (g, s) => {
+    const { W, H, narrow } = g;
+    const a0 = s.solo(0), a1 = s.solo(1), a2 = s.solo(2), a3 = s.solo(3);
+    const x0 = 40, x1 = W - 40;
+    if (a0 > 0.01) {
+      const ctx = 32768, nc = 4096, cached = ctx - nc;
+      const sx = (t) => x0 + (x1 - x0) * t / ctx;
+      const fork = ease(clamp(((s.t % 7) - 0.4) / 1.0));
+      g.text("source request", x0, 60, { size: 12, color: "ink-3", a: a0 });
+      g.rect(x0, 70, sx(cached) - x0, 26, { fill: "memory", r: 4, a: a0 * 0.8 });
+      g.text("shared prefix · 28,672 tokens, computed once", x0 + 10, 88, { size: 12, color: "sheet", weight: 600, a: a0 });
+      const lanes = 8, ly0 = 130, lh = Math.min(26, (H - 330) / lanes);
+      for (let k = 0; k < lanes; k++) {
+        const y = ly0 + k * (lh + 4), p = clamp(fork * 1.6 - k * 0.08);
+        g.rect(x0, y, sx(cached) - x0, lh, { fill: "memory", r: 3, a: a0 * 0.18 * p });
+        g.rect(sx(cached) + 2, y, (x1 - sx(cached)) * p, lh, { fill: "compute", r: 3, a: a0 * 0.75 });
+      }
+      g.text("forked: each request prefills its own 4,096-token suffix", x0, ly0 + lanes * (lh + 4) + 20, { size: 12, color: "compute", weight: 600, a: a0 });
+      // prefill chunks
+      const cy = ly0 + lanes * (lh + 4) + 60;
+      g.text("prefill steps: 32,768 suffix tokens each", x0, cy - 10, { size: 12, color: "ink-3", a: a0 });
+      for (let c = 0; c < 8; c++) g.rect(x0 + c * (x1 - x0) / 8 + 2, cy, (x1 - x0) / 8 - 4, 22, { fill: "compute", r: 3, a: a0 * (0.3 + 0.08 * c) });
+      const dy = cy + 70;
+      g.text("decode: 64 requests per rank reuse the prefix KV", x0, dy - 10, { size: 12, color: "ink-3", a: a0 });
+      for (let k = 0; k < 32; k++) g.rect(x0 + k * (x1 - x0) / 32 + 1, dy, (x1 - x0) / 32 - 3, 18, { fill: "ok", r: 2, a: a0 * 0.6 });
+      if (dy + 60 < H) g.text("prompts: random ordinary tokens · no special-token paths", x0, dy + 50, { size: 12, color: "ink-2", a: a0 });
+    }
+    if (a1 > 0.01) {
+      const rows = [
+        ["prefill", [["warmup", 5, "ink-3"], ["measure", 11, "compute"], ["profile", 2, "memory"]]],
+        ["decode", [["warmup", 50, "ink-3"], ["logged", 60, "cpu"], ["silent", 61, "compute"], ["profile", 3, "memory"]]],
+      ];
+      rows.forEach(([name, segs], r) => {
+        const y = 90 + r * 170, tot = segs.reduce((a, b) => a + b[1], 0);
+        g.text(name, x0, y - 16, { size: 20, font: "display", weight: 800, color: "ink", a: a1 });
+        let x = x0;
+        segs.forEach(([l, n, c], i) => {
+          const w = (x1 - x0) * n / tot;
+          const p = ramp(s.t % 6, 0.2 + i * 0.35 + r * 0.3, 0.4);
+          g.rect(x + 1, y, Math.max(2, (w - 2) * p), 40, { fill: c, r: 4, a: a1 * (c === "ink-3" ? 0.35 : 0.8) });
+          if (w > 50) g.text(l, x + 8, y + 25, { size: 12, color: c === "ink-3" ? "ink" : "sheet", weight: 600, a: a1 * p });
+          g.text(String(n) + (name === "prefill" && l === "measure" ? " samples" : ""), x + 4, y + 60, { size: 11, color: "ink-3", a: a1 * p });
+          x += w;
+        });
+      });
+      g.text("10 prefill intervals and 60 decode intervals between consecutive samples", x0, 90 + 2 * 170 - 30, { size: 13, color: "compute", weight: 600, a: a1 });
+      g.text("load-balance readings come from the logged segment; the silent one gives the number", x0, 90 + 2 * 170 - 6, { size: 12, color: "ink-2", a: a1 });
+    }
+    if (a2 > 0.01) {
+      const R = rng(8), n = 30, base = H * 0.5, hs = (H * 0.32) / 46, bw = (x1 - x0) / n;
+      const drop = ease(clamp(((s.t % 6) - 1.4) / 0.8));
+      g.text("step durations in the measured window", x0, 60, { size: 12, color: "ink-3", a: a2 });
+      for (let i = 0; i < n; i++) {
+        const fl = i === 9 || i === 19 || i === 29, d = 31 + (R() - 0.5) * 2 + (fl ? 12 : 0);
+        if (fl) g.hatch(x0 + i * bw + 1, base - d * hs, bw - 3, d * hs, { color: "bad", r: 2, a: a2 * (1 - 0.6 * drop) });
+        else g.rect(x0 + i * bw + 1, base - d * hs, bw - 3, d * hs, { fill: "compute", r: 2, a: a2 * 0.8 });
+      }
+      g.line(x0, base, x1, base, { color: "ink-3", lw: 1, a: a2 });
+      g.text("+~12 ms: MoE load-balance flush (all-gather across EP) → interval dropped", x0, base + 26, { size: 12, color: "bad", weight: 600, a: a2 });
+      const py = base + 80;
+      g.text("profiler", x0, py - 12, { size: 12, color: "ink-3", a: a2 });
+      const segs = [["prefill trace", 0.12, "memory"], ["measure (no profiler)", 0.7, "compute"], ["decode trace", 0.12, "memory"]];
+      let x = x0;
+      segs.forEach(([l, w, c]) => { g.rect(x + 1, py, (x1 - x0) * w - 2, 30, { fill: c, r: 4, a: a2 * 0.7 }); g.text(l, x + 8, py + 20, { size: 11, color: "sheet", weight: 600, a: a2 }); x += (x1 - x0) * w + 4; });
+      g.text("traces inflate steps up to ~50% at batch 1 · after detaching, 7–11% slower", x0, py + 54, { size: 12, color: "ink-2", a: a2 });
+      g.text("→ trace step times are for kernel composition only, never for speed", x0, py + 76, { size: 12, color: "ink-2", a: a2 });
+    }
+    if (a3 > 0.01) {
+      const alpha = 0.55 + 0.35 * (0.5 + 0.5 * Math.sin(s.t * 0.8));
+      const nx = 5, cw = narrow ? Math.min(50, (x1 - x0 - 130) / 6) : Math.min(60, (x1 - x0 - 140) / 6);
+      const lblX = narrow ? x0 + 120 : x0 + 120 + 6 * (cw + 6) + 6, lblDy = narrow ? 60 : 26;
+      g.text("tokens per request per step", x0, 66, { size: 12, color: "ink-3", a: a3 });
+      const rowsY = narrow ? [100, 190] : [100, 170];
+      g.text("counted", x0, rowsY[0] + 26, { size: 13, color: "ink", weight: 700, a: a3 });
+      g.text("delivered", x0, rowsY[1] + 26, { size: 13, color: "ok", weight: 700, a: a3 });
+      let surv = 1, exp = 1;
+      for (let j = 0; j <= nx; j++) {
+        const x = x0 + 120 + j * (cw + 6);
+        g.rect(x, rowsY[0], cw, 40, { fill: "compute", r: 4, a: a3 * 0.8 });
+        g.text(j === 0 ? "tok" : "d" + j, x + cw / 2, rowsY[0] + 26, { size: 12, color: "sheet", align: "center", weight: 700, a: a3 });
+        if (j > 0) { surv *= alpha; exp += surv; }
+        const f = j === 0 ? 1 : surv;
+        g.rect(x, rowsY[1], cw, 40, { stroke: "ok", lw: 1.2, r: 4, a: a3 * 0.6 });
+        g.rect(x, rowsY[1] + 40 * (1 - f), cw, 40 * f, { fill: "ok", r: 4, a: a3 * 0.8 });
+      }
+      g.text(`6 per step`, lblX, rowsY[0] + lblDy, { size: 14, color: "ink", weight: 700, a: a3 });
+      g.text(`${exp.toFixed(2)} expected at α = ${alpha.toFixed(2)}`, lblX, rowsY[1] + lblDy, { size: 14, color: "ok", weight: 700, a: a3 });
+      const fy = narrow ? 330 : 290;
+      g.text("decode tok/s/GPU = steps/s × requests × (1 + drafts) ÷ CP", x0, fy, { size: narrow ? 13 : 16, color: "ink", weight: 700, a: a3 });
+      g.text("64 requests × 6 = 384 tokens counted per step (default run)", x0, fy + 28, { size: 13, color: "ink-2", a: a3 });
+      g.text("published curves: 3 drafts, 75% each → τ = 1 + 3 × 0.75 = 3.25 per step", x0, fy + 54, { size: 13, color: "ok", a: a3 });
+      g.text("steps/s itself doesn't depend on acceptance: compare that", x0, fy + 80, { size: 13, color: "compute", weight: 600, a: a3 });
+    }
+  }, { anim: true, restT: 3 });
+
+  /* ---------------- pareto lab ---------------- */
+  const DEC = { ep64: [[325, 2600, 8], [315, 5050, 16], [297, 9500, 32], [246, 15700, 64], [179, 22800, 128], [103, 26300, 256]], ep8: [[238, 1900, 8], [230, 3700, 16], [220, 7000, 32], [198, 12600, 64], [150, 19200, 128], [98, 24900, 256]] };
+  const PRE = [[68, 60000, 4096], [114, 71600, 8192], [200, 81600, 16384], [376, 87000, 32768], [731, 89500, 65536]];
+  Atlas.scene("pareto", (g, s) => {
+    const st = s.state; if (st.ppt === undefined) return;
+    const { W, H } = g;
+    const mode = st.pmode || "decode";
+    const x0 = 100, x1 = W - 40, y0 = 40, y1 = H - 90;
+    const k = 1000;
+    const fmt = (v) => (v >= 1000 ? (v / 1000).toFixed(1) + "k" : String(v));
+    const out = document.getElementById("ppt").parentElement.querySelector("output");
+    if (mode === "decode") {
+      const i = Math.min(5, st.ppt);
+      if (out) out.textContent = String(DEC.ep64[i][2]);
+      const sx = (v) => x0 + (x1 - x0) * v / 350, sy = (v) => y1 - (y1 - y0) * v / 30000;
+      g.chart({ x0, y0, x1, y1, xmax: 350, ymax: 30000, xticks: [0, 100, 200, 300], yticks: [0, 10000, 20000, 30000], fy: (v) => v / k + "k", xlabel: "per-user speed (tokens/s/user)", ylabel: "tokens/s/GPU", ylabelOff: 62, tsize: 12,
+        series: [{ pts: DEC.ep8.map((p) => [p[0], p[1]]), color: "memory", dots: true }, { pts: DEC.ep64.map((p) => [p[0], p[1]]), color: "compute", dots: true }] });
+      [["ep64", "compute"], ["ep8", "memory"]].forEach(([key, c]) => {
+        const p = DEC[key][i];
+        g.circle(sx(p[0]), sy(p[1]), 11, { stroke: c, lw: 3 });
+        g.text(fmt(p[1]), sx(p[0]) + (key === "ep64" ? 16 : -16), sy(p[1]) + (key === "ep64" ? -10 : 18), { size: 13, color: c, weight: 700, align: key === "ep64" ? "left" : "right" });
+      });
+      g.chip(x0 + 16, y1 - 54, "EP64 · 384+64 experts", "compute", { size: 12 });
+      g.chip(x0 + 16, y1 - 24, "EP8 · 384+32 experts", "memory", { size: 12 });
+      const a = DEC.ep64[i], b = DEC.ep8[i];
+      document.getElementById("pa-1").textContent = fmt(a[1]);
+      document.getElementById("pa-1l").textContent = "EP64 tokens/s/GPU";
+      document.getElementById("pa-2").textContent = fmt(b[1]);
+      document.getElementById("pa-2l").textContent = "EP8 tokens/s/GPU";
+      document.getElementById("pa-note").textContent = `At ${a[2]} requests per rank: EP64 gives each user ${a[0]} tok/s (≈${(3.25 / a[0] * 1000).toFixed(0)} ms per step), EP8 ${b[0]} tok/s. Counted at τ = 3.25 tokens per step (3 drafts, 75% acceptance).`;
+    } else {
+      const i = Math.min(4, st.ppt);
+      if (out) out.textContent = PRE[i][2].toLocaleString("en-US") + " tok";
+      const sx = (v) => x0 + (x1 - x0) * v / 800, sy = (v) => y1 - (y1 - y0) * v / 100000;
+      g.chart({ x0, y0, x1, y1, xmax: 800, ymax: 100000, xticks: [0, 200, 400, 600, 800], yticks: [0, 25000, 50000, 75000, 100000], fy: (v) => v / k + "k", xlabel: "latency (ms per prefill step)", ylabel: "non-cached tokens/s/GPU", ylabelOff: 62, tsize: 12,
+        series: [{ pts: PRE.map((p) => [p[0], p[1]]), color: "compute", dots: true }] });
+      const p = PRE[i];
+      g.circle(sx(p[0]), sy(p[1]), 11, { stroke: "compute", lw: 3 });
+      g.text(fmt(p[1]), sx(p[0]), sy(p[1]) - 18, { size: 13, color: "compute", weight: 700, align: "center" });
+      g.chip(x1 - 10, y1 - 24, "EP4DP4 · bounded replay 140", "compute", { size: 12, align: "right" });
+      document.getElementById("pa-1").textContent = fmt(p[1]);
+      document.getElementById("pa-1l").textContent = "non-cached tokens/s/GPU";
+      document.getElementById("pa-2").textContent = p[0] + " ms";
+      document.getElementById("pa-2l").textContent = "per prefill step";
+      document.getElementById("pa-note").textContent = `${p[2].toLocaleString("en-US")} tokens per step per rank. Past ~16K tokens the GPU is saturated: doubling the chunk doubles latency for a few percent more throughput.`;
+    }
+    g.text("source: DeepInfer README and deployment Q&A sweep plots · 128K context", x0, H - 16, { size: 11, color: "ink-3" });
+  }, { controls: "par-ctl", format: (id, v) => String(v) });
+
+  /* ---------------- correctness ---------------- */
+  Atlas.scene("checks", (g, s) => {
+    const { W, H, narrow } = g;
+    const a0 = s.solo(0), a1 = s.solo(1), a2 = s.solo(2);
+    const x0 = 40, x1 = W - 40;
+    if (a0 > 0.01) {
+      const ranks = 4, samples = 5, cw = (x1 - x0 - 90) / samples;
+      const fail = (s.t % 8) > 4.5;
+      g.text("baseline vs this run · decode perplexity per sample", x0, 56, { size: 12, color: "ink-3", a: a0 });
+      for (let r = 0; r < ranks; r++) {
+        const y = 80 + r * 64;
+        g.text("DP " + r, x0, y + 30, { size: 12, color: "ink-2", a: a0 });
+        for (let j = 0; j < samples; j++) {
+          const x = x0 + 70 + j * cw, bad = fail && r === 2 && j === 3;
+          const R = rng(r * 10 + j + 1), w1 = 0.4 + 0.5 * R();
+          g.rect(x, y + 6, (cw - 12) * w1, 12, { fill: "ink-3", r: 2, a: a0 * 0.5 });
+          g.rect(x, y + 24, (cw - 12) * (w1 + (bad ? 0.04 : 0)), 12, { fill: bad ? "bad" : "compute", r: 2, a: a0 * 0.8 });
+          g.text(bad ? "✗" : "✓", x + cw - 14, y + 34, { size: 15, color: bad ? "bad" : "ok", weight: 700, a: a0 });
+        }
+      }
+      const ty = 80 + ranks * 64 + 20;
+      g.text(fail ? "one sample differs → run fails" : "every sample equal → pass", x0, ty, { size: 15, color: fail ? "bad" : "ok", weight: 700, a: a0 });
+      g.text("intended numeric change? confirm, then refresh the baseline", x0, ty + 26, { size: 12, color: "ink-2", a: a0 });
+      g.text("text, single-image, 3-image and 5-image prompts · long: 16,389 in, 4,096 out", x0, ty + 50, { size: 12, color: "ink-3", a: a0 });
+    }
+    if (a1 > 0.01) {
+      const tests = [
+        ["batch invariance", "batched = one at a time (tokens, logprobs)", "compute"],
+        ["vision encoder", "batched = one at a time", "net"],
+        ["KL", "two logprob passes within a bound", "cpu"],
+        ["sampler", "sampling correctness cases", "ok"],
+        ["EPLB policy", "structure · determinism · objective", "memory"],
+        ["TileLang ops", "pytest beside nearly every op, vs reference", "compute"],
+        ["random sampling", "frequency bound + row-permutation invariance", "ok"],
+      ];
+      const rh = Math.min(52, (H - 120) / tests.length);
+      tests.forEach(([n, d, c], i) => {
+        const y = 70 + i * rh, p = ramp(s.t % 6, 0.2 + i * 0.15, 0.3);
+        g.rect(x0, y, x1 - x0, rh - 8, { fill: c, r: 6, a: a1 * 0.08 * p + 0.02 });
+        g.rect(x0, y, 6, rh - 8, { fill: c, r: 3, a: a1 * p });
+        g.text(n, x0 + 18, y + (rh - 8) / 2 + 5, { size: 14, color: "ink", weight: 700, a: a1 * p });
+        g.text(d, narrow ? x1 - 10 : x0 + 200, y + (rh - 8) / 2 + 5, { size: 12, color: "ink-2", align: narrow ? "right" : "left", a: a1 * p });
+        g.text("✓", x1 - 14, y + (rh - 8) / 2 + 6, { size: 16, color: "ok", weight: 700, a: a1 * p * (narrow ? 0 : 1) });
+      });
+    }
+    if (a2 > 0.01) {
+      const suites = [["AIME 2026", "30 problems × 32 samples"], ["HLE", "2,500 questions · 342 with images · × 1"], ["GPQA Diamond", "198 questions × 8 samples"]];
+      suites.forEach(([n, d], i) => {
+        const y = 70 + i * 74;
+        g.box(x0, y, narrow ? x1 - x0 : (x1 - x0) * 0.46, 58, { color: "compute", a: a2, wash: 0.06 });
+        g.text(n, x0 + 14, y + 26, { size: 18, font: "display", weight: 800, color: "ink", a: a2 });
+        g.text(d, x0 + 14, y + 46, { size: 11, color: "ink-2", a: a2 });
+        if (!narrow) g.curve([x0 + (x1 - x0) * 0.46 + 4, y + 29], [x0 + (x1 - x0) * 0.56, y + 29], [x0 + (x1 - x0) * 0.6, 140], { color: "hair", lw: 1.5, head: 7, a: a2 });
+      });
+      const px = narrow ? x0 : x0 + (x1 - x0) * 0.62, pw = narrow ? x1 - x0 : x1 - px, py = narrow ? 300 : 80;
+      const steps = [["generate", "one batch, raw outputs to disk", "compute"], ["score", "re-runnable, judge swappable", "ok"], ["Pass@1", "mean over samples", "ink"]];
+      steps.forEach(([n, d, c], i) => {
+        const y = py + i * 70;
+        g.box(px, y, pw, 54, { color: c, a: a2 });
+        g.text(n, px + 14, y + 24, { size: 15, color: c, weight: 700, a: a2 });
+        g.text(d, px + 14, y + 42, { size: 11, color: "ink-2", a: a2 });
+        if (i < 2) g.arrow(px + pw / 2, y + 56, px + pw / 2, y + 68, { color: "ink-3", lw: 1.2, head: 7, a: a2 });
+      });
+      const ny = Math.max(py + 3 * 70, 70 + 3 * 74) + 30;
+      if (ny < H - 10) g.text("prompts rendered by the encoder shipped with the checkpoint", x0, ny, { size: 12, color: "ink-3", a: a2 });
+    }
+  }, { anim: true, restT: 3.5 });
+})();
+
+</script>
+<script>AtlasAlts.render("alts-measure", "sources-measure", "measure");</script>
+</body>
+</html>

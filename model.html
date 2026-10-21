@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>The model it serves · DeepInfer Annotated</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&display=swap">
+<link rel="stylesheet" href="atlas.css">
+</head>
+<body>
+<header class="bar">
+  <div class="wrap">
+    <a class="brand" href="index.html"><b>DeepInfer</b><span>annotated</span></a>
+    <nav aria-label="Chapters">
+      <a class="num" href="loop.html" title="The generation loop">01</a>
+      <a class="num" href="model.html" aria-current="page" title="The model it serves">02</a>
+      <a class="num" href="engine.html" title="Anatomy of the engine">03</a>
+      <a class="num" href="memory.html" title="KV memory">04</a>
+      <a class="num" href="scheduling.html" title="Scheduling a step">05</a>
+      <a class="num" href="parallelism.html" title="One model, many GPUs">06</a>
+      <a class="num" href="cluster.html" title="The cluster around it">07</a>
+      <a class="num" href="replay.html" title="Bounded replay">08</a>
+      <a class="num" href="speculation.html" title="Speculative decoding">09</a>
+      <a class="num" href="kernels.html" title="Numbers and kernels">10</a>
+      <a class="num" href="sampling.html" title="Sampling, structure, determinism">11</a>
+      <a class="num" href="frontdoor.html" title="The front door">12</a>
+      <a class="num" href="measure.html" title="Measuring it">13</a>
+      <a href="index.html">Map</a>
+    </nav>
+  </div>
+  <div class="progress"></div>
+</header>
+<main>
+  <section class="hero">
+    <div class="wrap">
+      <div>
+        <span class="eyebrow"><span class="n">02</span> The workload</span>
+        <h1>The model <em>sets the rules</em></h1>
+        <p class="dek">DeepSeek V4.1 Flash is a 40-layer mixture of experts with two kinds of attention cache, layers that borrow each other's keys, and a lookup table of n-grams. Each choice becomes engine code.</p>
+        <div class="files">
+          <span class="tag">hugging_face/config.py</span>
+          <span class="tag">models/v4_modules/attn.py</span>
+          <span class="tag">v4_modules/cross_layer.py</span>
+          <span class="tag">v4_modules/engram.py</span>
+        </div>
+      </div>
+      <div class="board stage-card" data-stage="tower" data-label="The 40 layers of V4.1 Flash drawn as a barcode: early layers process the whole prompt, later layers reuse their keys; KV source layers and Engram layers are marked; three draft layers sit on top.">
+        <span class="ruler">40 layers + 3 draft layers</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <div class="facts">
+        <div><b>40</b><span>transformer layers, hidden size 5,120</span></div>
+        <div><b>384 + 1</b><span>routed experts plus a shared expert in every MoE layer</span></div>
+        <div><b>top-6</b><span>experts per token</span></div>
+        <div><b>128</b><span>tokens in the sliding attention window</span></div>
+        <div><b>129,280</b><span>vocabulary entries</span></div>
+        <div><b>3</b><span>draft layers for speculative decoding</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="layer">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Inside one layer</span>
+        <h2>Five parts, one token's trip</h2>
+        <p class="lede">Follow a single token through one layer. Each part answers a different cost problem from chapter 01.</p>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">Residual streams · mHC</span><h4>Several lanes instead of one</h4><p>A classic transformer carries one residual vector from layer to layer. V4.1 carries several parallel streams. Before each sub-layer, learned weights mix them into one input; afterwards, the result is written back into every stream with its own weight. The code calls these hyper-connections (<code>hc.py</code>).</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Attention · near</span><h4>Exact attention over the last 128 tokens</h4><p>Every layer attends precisely to a sliding window of the most recent 128 tokens. That window's keys and values are small and bounded: the cache never grows past 128 entries per layer, no matter how long the conversation.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Attention · far</span><h4>Compressed, then selected</h4><p>Everything older is reached through a compressed cache: a gated low-rank compressor folds every <i>r</i> tokens into one entry, stored in 4-bit floating point. A small indexer scores entries with <code>relu(q·k)·w</code> and the layer attends only to the top-k. Long context gets cheap without a dense scan.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Feed-forward · MoE</span><h4>Six experts out of 384</h4><p>A router scores 384 experts and sends the token to six of them, plus one shared expert that sees every token. Most of the model's parameters live here, and each token touches only a sliver of them.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Engram · layers 1 and 14</span><h4>A lookup, not a computation</h4><p>Two layers add an Engram: the last few tokens are hashed as 2-, 3- and 4-grams into huge embedding tables, the rows are fetched, projected and gated into the hidden state. Memorized phrases come from a table lookup instead of from matrix multiplies.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="layer" data-label="Block diagram of one V4.1 layer: residual streams mixed before and after each sub-layer; sliding-window attention; compressed sparse attention with an indexer; mixture-of-experts feed-forward; Engram lookup."><span class="ruler">one layer · one token</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="across">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Across layers</span>
+        <h2>Layers that reuse each other's work</h2>
+        <p class="lede">The biggest savings in V4.1 come from layers not doing their own copy of a job.</p>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">Shared KV</span><h4>Four layers write, the rest read</h4><p>Only layers 2, 8, 14 and 20 produce long-range KV. Every other layer reads the KV of the nearest source layer below it. The indexer modules are shared on a similar schedule (sources 2, 8, 14, 20, 24, 28, 32, 36). DeepInfer derives this map once in <code>SharedLayerTopology</code>.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">YOCO split</span><h4>The upper half doesn't read the prompt itself</h4><p>The later layers are "consumer" layers: their long-range KV is projected from the hidden state of the last early layer, as in Microsoft's You Only Cache Once. They still keep their own sliding window. Chapter 08 shows how this lets prefill skip most of their work.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Draft layers</span><h4>Three extra layers propose the future</h4><p>On top sit three DFlash draft layers with smaller MoEs (128 experts, top-3). They read hidden states from target layers 37, 38 and 39 and propose a block of next tokens for speculative decoding (chapter 09).</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Consequence</span><h4>Every feature becomes engine code</h4><p>Two caches with different lifetimes, cross-layer metadata, a replay path, an indexer cache, hashed tables sharded across GPUs, and a drafter with its own CUDA graphs. The rest of this site is how DeepInfer handles each one.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="across" data-label="The 40 layers drawn left to right with arcs from KV source layers to the layers that reuse their KV, the boundary where consumer layers begin, and three draft layers reading the top layers."><span class="ruler">layer 0 → 39</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="consequences">
+    <div class="wrap stack">
+      <header>
+        <span class="eyebrow">Feature → engine</span>
+        <h2>What each choice costs the engine</h2>
+      </header>
+      <div class="compare">
+        <article class="alt"><div><h4>384 + 1 experts, top-6</h4></div><div><p>Tokens scatter across experts, so the experts are spread over many GPUs and tokens travel to them.</p></div><div class="vs">Expert parallelism, DeepEP all-to-all, expert load balancing → <a href="parallelism.html">chapter 06</a></div></article>
+        <article class="alt"><div><h4>128-token window</h4></div><div><p>A bounded cache that belongs to one sequence and never grows.</p></div><div class="vs">A fixed per-sequence state slot → <a href="memory.html">04</a>; replay when it's missing → <a href="replay.html">08</a></div></article>
+        <article class="alt"><div><h4>Compressed FP4 long-range KV</h4></div><div><p>Small blocks that are cheap to store and move.</p></div><div class="vs">Paged blocks → <a href="memory.html">04</a>; a days-long SSD cache shared by the whole cluster → <a href="cluster.html">07</a></div></article>
+        <article class="alt"><div><h4>Sparse indexer</h4></div><div><p>A second, tiny cache of index keys and a top-k selection on every step.</p></div><div class="vs">MXFP4 indexer KV, DeepSelect and DeepGEMM indexer kernels → <a href="kernels.html">10</a></div></article>
+        <article class="alt"><div><h4>Shared KV and YOCO</h4></div><div><p>Most layers don't write long-range KV, and the upper half reads the lower half's.</p></div><div class="vs">Cross-layer runtime metadata; decoder prefill truncated to 140 tokens → <a href="replay.html">08</a></div></article>
+        <article class="alt"><div><h4>Engram tables</h4></div><div><p>Huge embedding tables addressed by hashing n-grams of a compressed vocabulary.</p></div><div class="vs">Tables sharded across GPUs and gathered by hash each step; a compressed-tokenizer lookup in the scheduler → <a href="kernels.html">10</a></div></article>
+        <article class="alt"><div><h4>Three draft layers</h4></div><div><p>A small model that runs every decode step.</p></div><div class="vs">DSpark scheduling, a separate CUDA graph runner, confidence-driven verify lengths → <a href="speculation.html">09</a></div></article>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="lab">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Try it</span>
+        <h2>How much memory does one token cost?</h2>
+        <p class="lede">KV bytes per token decide how many requests fit on a GPU and whether a cache can live on disk. Compare attention designs, then turn the knobs that V4.1 turns.</p>
+      </header>
+      <div class="lab">
+        <div class="controls" id="kv-ctl">
+          <div class="ctl"><label for="ratio">Compression ratio r (tokens per entry) <output for="ratio">2</output></label><input type="range" id="ratio" min="1" max="8" step="1" value="2"></div>
+          <div class="ctl"><label for="src">Layers that store long-range KV <output for="src">4</output></label><input type="range" id="src" min="1" max="40" step="1" value="4"></div>
+          <div class="ctl"><label for="bits">Bits per value <output for="bits">4</output></label><input type="range" id="bits" min="4" max="16" step="4" value="4"></div>
+          <div class="ctl"><label for="ctxk">Context length <output for="ctxk">128K</output></label><input type="range" id="ctxk" min="1" max="8" step="1" value="8"></div>
+          <div class="readout">
+            <div><b id="kv-tok">–</b><span>bytes per token (knobs)</span></div>
+            <div><b id="kv-req">–</b><span>per 1 request at this context</span></div>
+          </div>
+          <p class="note">Reference designs use published shapes: GPT-3 175B (96 layers × 96 heads × 128), Llama-3-70B GQA (80 layers × 8 KV heads × 128), DeepSeek-V3 MLA (61 layers × 576 latent), all at 16 bits. The knob row starts at an estimate for V4.1 from its config: 4 KV source layers, 512-value entries in FP4 with a scale per 16, r = 2, plus a 128-dim FP4 index key. DeepSeek hasn't published a per-token figure; treat it as an estimate.</p>
+        </div>
+        <div class="board" data-stage="kvcalc" data-label="Bar chart on a log scale of KV bytes per token for MHA, GQA, MLA and the compressed design set by the knobs."><span class="ruler">bytes per token · log scale</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="others">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Other ways to do it</span>
+        <h2>Who else shrinks attention, and how</h2>
+        <p class="lede">Every lab fights the same KV bill. V4.1 combines several known tricks; others pick one or two.</p>
+      </header>
+      <div class="compare" id="alts-model"></div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap"><div class="sources" id="sources-model"></div></div>
+  </section>
+
+</main>
+<nav class="next" aria-label="Chapter navigation">
+  <div class="wrap">
+    <a href="loop.html"><span>← Chapter 01</span><b>The generation loop</b></a>
+    <a class="fwd" href="engine.html"><span>Chapter 03 →</span><b>Anatomy of the engine</b></a>
+  </div>
+</nav>
+<script src="atlas.js"></script>
+<script src="alts.js"></script>
+<script>
+(function () {
+  const { ramp, ease, clamp, lerp, rng } = Atlas;
+  const KV_SRC = [2, 8, 14, 20];
+  const IDX_SRC = [2, 8, 14, 20, 24, 28, 32, 36];
+  const ENGRAM = [1, 14];
+  const SPLIT = 20; // early (prompt-reading) layers 0..19, consumer layers 20..39
+
+  /* ---------------- hero: the layer barcode ---------------- */
+  Atlas.scene("tower", (g, s) => {
+    const { W, H } = g;
+    const x0 = 40, x1 = W - 40, n = 43, gapAt = 40;
+    const cw = (x1 - x0 - 24) / n;
+    const top = 70, bot = H - 110;
+    const colX = (i) => x0 + i * cw + (i >= gapAt ? 24 : 0);
+    const per = 0.09, cyc = n * per + 2.2;
+    const tt = s.t % cyc;
+    const head = tt / per;
+    // bands
+    g.rect(colX(0) - 4, top - 30, colX(SPLIT) - colX(0) - 2, 22, { fill: "compute", r: 4, a: 0.12 });
+    g.text("reads the whole prompt", colX(0), top - 14, { size: 14, color: "compute", weight: 600 });
+    g.rect(colX(SPLIT) - 2, top - 30, colX(40) - colX(SPLIT) - 4, 22, { fill: "memory", r: 4, a: 0.12 });
+    g.text("reuses KV from below", colX(SPLIT) + 4, top - 14, { size: 14, color: "memory", weight: 600 });
+    for (let i = 0; i < n; i++) {
+      const x = colX(i), draft = i >= 40;
+      const lit = Math.max(0, 1 - Math.abs(head - i) / 2.5);
+      const base = draft ? "cpu" : i < SPLIT ? "compute" : "memory";
+      g.rect(x, top, cw * 0.72, bot - top, { fill: base, r: 2, a: 0.22 + 0.7 * lit });
+      if (KV_SRC.includes(i)) g.rect(x - 2, bot + 8, cw * 0.72 + 4, 8, { fill: "memory", r: 2 });
+      if (ENGRAM.includes(i)) g.circle(x + cw * 0.36, top - 46, 5, { fill: "ok" });
+    }
+    // KV reuse arcs from the source the pulse just passed
+    KV_SRC.forEach((src, k) => {
+      const next = k + 1 < KV_SRC.length ? KV_SRC[k + 1] : 40;
+      const a = clamp(1 - Math.abs(head - src - 3) / 6);
+      if (a <= 0) return;
+      for (let j = src + 1; j < next; j++) {
+        const p0 = [colX(src) + cw * 0.36, bot + 18], p2 = [colX(j) + cw * 0.36, bot + 18];
+        g.curve(p0, [(p0[0] + p2[0]) / 2, bot + 18 + 12 + (j - src) * 3], p2, { color: "memory", lw: 1.2, a: a * 0.7, arrow: false });
+      }
+    });
+    g.text("KV source layers", x0, H - 46, { size: 13, color: "memory" });
+    g.circle(x0 + 150, H - 50, 5, { fill: "ok" });
+    g.text("Engram", x0 + 160, H - 46, { size: 13, color: "ok" });
+    g.rect(x0 + 232, H - 56, 10, 12, { fill: "cpu", r: 2, a: 0.6 });
+    g.text("draft layers", x0 + 248, H - 46, { size: 13, color: "cpu" });
+    g.text("layer 0", colX(0), bot + 40, { size: 12, color: "ink-3" });
+    g.text("39", colX(39) + cw * 0.72, bot + 40, { size: 12, color: "ink-3", align: "right" });
+  }, { anim: true, restT: 2.2, zoom: 1.0, minW: 560 });
+
+  /* ---------------- one layer ---------------- */
+  function regions(g) {
+    const { W, H, narrow } = g;
+    return narrow
+      ? { d: { x: 30, y: 46, w: W - 60, h: H * 0.48 }, p: { x: 30, y: H * 0.56, w: W - 60, h: H * 0.42 } }
+      : { d: { x: 40, y: 56, w: W * 0.4, h: H - 100 }, p: { x: W * 0.48, y: 70, w: W * 0.52 - 40, h: H - 120 } };
+  }
+  Atlas.scene("layer", (g, s) => {
+    const { d, p } = regions(g);
+    const b = s.b;
+    const f = [0, 1, 2, 3, 4].map((i) => s.solo(i)); // focus weights
+    const streams = 4, sx0 = d.x + 6, sgap = 12;
+    const sxs = Array.from({ length: streams }, (_, k) => sx0 + k * sgap);
+    const bx = d.x + 90, bw = d.w - 90;
+    const yTop = d.y + 10, yBot = d.y + d.h - 10;
+    const showEng = s.at(4);
+    // blocks: [name, y0, y1, color, focus]
+    const hTot = yBot - yTop;
+    const blocks = [];
+    blocks.push(["moe", yTop + hTot * 0.12, yTop + hTot * 0.36, "compute", f[3]]);
+    blocks.push(["attn", yTop + hTot * 0.46, yTop + hTot * 0.7, "memory", Math.max(f[1], f[2])]);
+    if (showEng > 0.01) blocks.push(["eng", yTop + hTot * 0.78, yTop + hTot * 0.9, "ok", f[4]]);
+    // streams
+    sxs.forEach((x) => g.line(x, yBot, x, yTop, { color: "ink-3", lw: 2, a: 0.35 + 0.5 * f[0] }));
+    g.text("residual streams", sxs[0] - 2, yBot + 18, { size: 12, color: "ink-3" });
+    const anyFocus = Math.max(...f);
+    blocks.forEach(([name, y0, y1, color, foc]) => {
+      const dim = 1 - 0.55 * (anyFocus > 0.3 ? 1 - foc : 0) * (name === "eng" ? 0 : 1);
+      const a = name === "eng" ? showEng : dim;
+      // pre-mix curves into block bottom-left, post-mix from block top back to streams
+      sxs.forEach((x, k) => {
+        g.curve([x, y1 + 18], [x + 30, y1 + 4], [bx, (y0 + y1) / 2 + 10], { color: "ink-3", lw: 1.3, a: a * (0.35 + 0.55 * f[0]), arrow: false });
+        g.curve([bx, y0 + 8], [x + 40, y0 - 6], [x, y0 - 18], { color: color, lw: 1.3, a: a * (0.3 + 0.6 * f[0]), arrow: false });
+      });
+      if (name === "attn") {
+        const hw = bw / 2 - 4;
+        g.box(bx, y0, hw, y1 - y0, { color: "memory", a: a * (f[1] > 0.3 || anyFocus < 0.3 ? 1 : 0.6), wash: 0.08 + 0.18 * f[1], lw: 1.5 + 1.5 * f[1] });
+        g.text("WINDOW", bx + hw / 2, (y0 + y1) / 2 - 2, { size: 18, font: "display", weight: 800, color: "memory", align: "center", a });
+        g.text("last 128", bx + hw / 2, (y0 + y1) / 2 + 18, { size: 12, color: "ink-2", align: "center", a });
+        g.box(bx + hw + 8, y0, hw, y1 - y0, { color: "net", a: a * (f[2] > 0.3 || anyFocus < 0.3 ? 1 : 0.6), wash: 0.08 + 0.18 * f[2], lw: 1.5 + 1.5 * f[2] });
+        g.text("COMPRESSED", bx + hw * 1.5 + 8, (y0 + y1) / 2 - 2, { size: 18, font: "display", weight: 800, color: "net", align: "center", a });
+        g.text("top-k via indexer", bx + hw * 1.5 + 8, (y0 + y1) / 2 + 18, { size: 12, color: "ink-2", align: "center", a });
+      } else {
+        const title = name === "moe" ? "MoE FEED-FORWARD" : "ENGRAM";
+        const sub = name === "moe" ? "6 of 384 experts + shared" : "n-gram table lookup";
+        g.box(bx, y0, bw, y1 - y0, { color, a, wash: 0.08 + 0.18 * foc, lw: 1.5 + 1.5 * foc, title, sub, tsize: 22, ssize: 12 });
+      }
+    });
+    g.text("token in ↑", bx + bw / 2, yBot + 18, { size: 12, color: "ink-3", align: "center" });
+    g.arrow(bx + bw / 2, yTop + 24, bx + bw / 2, yTop - 2, { color: "ink-3", lw: 1.5, head: 8 });
+    g.text("to the next layer", bx + bw / 2 + 10, yTop + 14, { size: 12, color: "ink-3" });
+
+    // ---- detail panel ----
+    const P = p;
+    // b0: mixing matrices
+    if (f[0] > 0.01) {
+      const a = f[0], cs = Math.min(26, P.w / 16);
+      const R = rng(7);
+      [["pre-mix", 4, 1], ["residual mix", 4, 4], ["post-mix", 1, 4]].forEach(([lab, r, c], k) => {
+        const ox = P.x + k * (P.w / 3), oy = P.y + 40;
+        g.text(lab, ox, oy - 12, { size: 13, color: "ink-2", a });
+        for (let i = 0; i < r; i++) for (let j = 0; j < c; j++) g.rect(ox + j * cs, oy + i * cs, cs - 3, cs - 3, { fill: "compute", r: 3, a: a * (0.15 + 0.8 * R()) });
+      });
+      g.text("weights depend on the token (hc_dynamic)", P.x, P.y + 40 + 4 * cs + 30, { size: 13, color: "ink-3", a });
+      g.text("hc_mult streams in, one hidden state through the sub-layer, hc_mult streams out", P.x, P.y + 40 + 4 * cs + 54, { size: 13, color: "ink-3", a });
+    }
+    // token strip helper
+    const strip = (a, mode) => {
+      const n = 26, tw_ = Math.min(26, (P.w - 10) / n), y = P.y + P.h * 0.62;
+      const cur = n - 1;
+      for (let i = 0; i < n; i++) {
+        const inWin = i >= n - 8;
+        let col = "grid";
+        if (mode === "win" && inWin) col = "memory";
+        g.rect(P.x + i * tw_, y, tw_ - 4, tw_ - 4, { fill: i === cur ? "compute" : col, r: 3, a: a * (mode === "comp" && !inWin ? 0.5 : 1) });
+      }
+      g.text("older ←", P.x, y + tw_ + 18, { size: 12, color: "ink-3", a });
+      g.text("→ newest", P.x + n * tw_, y + tw_ + 18, { size: 12, color: "ink-3", a, align: "right" });
+      return { y, tw_, n };
+    };
+    if (f[1] > 0.01) {
+      const a = f[1];
+      const { y, tw_, n } = strip(a, "win");
+      g.dim(P.x + (n - 8) * tw_, P.x + n * tw_ - 4, y - 18, "128 tokens", { color: "memory", a });
+      for (let i = n - 8; i < n - 1; i++) g.curve([P.x + (n - 1) * tw_ + tw_ / 2 - 2, y - 2], [P.x + (i + n - 1) / 2 * tw_ + tw_ / 2, y - 40 - (n - 1 - i) * 4], [P.x + i * tw_ + tw_ / 2 - 2, y - 2], { color: "compute", lw: 1.4, a: a * 0.8, prog: ramp(s.t % 4, (n - 2 - i) * 0.08, 0.4) });
+      g.text("Exact attention. Size is fixed:", P.x, P.y + 30, { size: 15, color: "ink", a });
+      g.text("128 entries per layer, forever.", P.x, P.y + 52, { size: 15, color: "ink", a });
+    }
+    if (f[2] > 0.01) {
+      const a = f[2];
+      const { y, tw_, n } = strip(a, "comp");
+      const groups = Math.floor((n - 8) / 2);
+      const scores = [0.2, 0.8, 0.35, 0.15, 0.9, 0.4, 0.1, 0.7, 0.25, 0.6, 0.3, 0.05, 0.5];
+      const topk = scores.map((v, i) => [v, i]).sort((a1, b1) => b1[0] - a1[0]).slice(0, 4).map((q) => q[1]);
+      for (let gI = 0; gI < groups; gI++) {
+        const gx = P.x + gI * 2 * tw_, gy = y - 70;
+        const sel = topk.includes(gI);
+        g.rect(gx, gy, tw_ * 2 - 4, tw_ - 4, { fill: sel ? "net" : "grid", stroke: "net", lw: 1, r: 3, a });
+        g.line(gx + tw_ - 2, gy + tw_ - 2, gx + tw_ - 2, y - 4, { color: "net", lw: 1, a: a * 0.5 });
+        const bh = 40 * scores[gI];
+        g.rect(gx + 2, gy - 8 - bh, tw_ * 2 - 8, bh, { fill: sel ? "net" : "ink-3", r: 2, a: a * (sel ? 0.9 : 0.3) });
+      }
+      g.text("indexer score relu(q·k)·w", P.x, y - 130, { size: 13, color: "net", a });
+      g.text("compressed entries · FP4 · r tokens each", P.x, y - 80 + 4, { size: 12, color: "ink-3", a: 0 });
+      g.text("Older tokens fold into compressed entries;", P.x, P.y + 30, { size: 15, color: "ink", a });
+      g.text("the query attends only to the top-k.", P.x, P.y + 52, { size: 15, color: "ink", a });
+    }
+    if (f[3] > 0.01) {
+      const a = f[3];
+      const cols = 24, rows = 16, cs = Math.min((P.w - 10) / cols, (P.h - 80) / rows);
+      const R = rng(42);
+      const pick = new Set(); while (pick.size < 6) pick.add(Math.floor(R() * 384));
+      for (let e = 0; e < 384; e++) {
+        const r_ = Math.floor(e / cols), q = e % cols;
+        g.rect(P.x + q * cs, P.y + 50 + r_ * cs, cs - 2, cs - 2, { fill: pick.has(e) ? "compute" : "grid", r: 2, a });
+      }
+      g.text("router picks 6 of 384 (+1 shared, not shown)", P.x, P.y + 30, { size: 15, color: "ink", a });
+    }
+    if (f[4] > 0.01) {
+      const a = f[4];
+      const toks = ["…", "on", "the", "mat"];
+      let x = P.x;
+      toks.forEach((t) => { x += g.pill(x, P.y + 40, t, { size: 15, a }) + 6; });
+      const grams = [["2-gram", "the mat"], ["3-gram", "on the mat"], ["4-gram", "… on the mat"]];
+      grams.forEach(([k, v], i) => {
+        const y = P.y + 96 + i * 46;
+        g.text(k, P.x, y + 5, { size: 13, color: "ink-3", a });
+        g.pill(P.x + 70, y, v, { size: 14, a, stroke: "ok", color: "ok" });
+        g.arrow(P.x + 200, y, P.x + P.w * 0.55, P.y + 110 + i * 46, { color: "ok", lw: 1.3, head: 8, a: a * 0.8 });
+        g.text("hash", P.x + 210, y - 6, { size: 11, color: "ink-3", a });
+      });
+      const tx = P.x + P.w * 0.58, tw2 = P.w * 0.38;
+      g.text("tables · ~16M rows each", tx, P.y + 76, { size: 12, color: "ink-3", a });
+      for (let r = 0; r < 14; r++) g.rect(tx, P.y + 86 + r * 11, tw2, 8, { fill: [3, 6, 10].includes(r) ? "ok" : "grid", r: 2, a });
+      g.text("gather → project → gate into the hidden state", P.x, P.y + P.h - 20, { size: 13, color: "ink-2", a });
+    }
+  }, { anim: true, restT: 2.5 });
+
+  /* ---------------- across layers ---------------- */
+  Atlas.scene("across", (g, s) => {
+    const { W, H, narrow } = g;
+    const x0 = 46, x1 = W - (narrow ? 70 : 140);
+    const cw = (x1 - x0) / 40;
+    const cy = H * 0.42, ch = H * 0.22;
+    const cx = (i) => x0 + i * cw;
+    const yb = s.at(1), dr = s.at(2), cons = s.at(3);
+    // halves (beat 1)
+    if (yb > 0.01) {
+      g.rect(cx(0) - 4, cy - ch / 2 - 40, cx(SPLIT) - cx(0), ch + 80, { fill: "compute", r: 8, a: 0.08 * yb });
+      g.rect(cx(SPLIT) - 2, cy - ch / 2 - 40, cx(40) - cx(SPLIT), ch + 80, { fill: "memory", r: 8, a: 0.1 * yb });
+      g.text("EARLY LAYERS · read the prompt", cx(0), cy - ch / 2 - 50, { size: 16, font: "display", weight: 800, color: "compute", a: yb });
+      g.text("CONSUMER LAYERS · own window only", cx(SPLIT), cy - ch / 2 - 50, { size: 16, font: "display", weight: 800, color: "memory", a: yb });
+    }
+    for (let i = 0; i < 40; i++) {
+      const isSrc = KV_SRC.includes(i);
+      const col = isSrc ? "memory" : i < SPLIT ? "compute" : "ink-3";
+      g.rect(cx(i) + 1, cy - ch / 2, cw - 3, ch, { fill: col, r: 2, a: isSrc ? 0.9 : 0.35 });
+      if (i % 5 === 0 || i === 39) g.text(String(i), cx(i) + cw / 2, cy + ch / 2 + 18, { size: 11, color: "ink-3", align: "center" });
+    }
+    // KV arcs (beat 0 onwards)
+    const ka = ramp(s.b, 0, 0.4);
+    KV_SRC.forEach((src, k) => {
+      const next = k + 1 < KV_SRC.length ? KV_SRC[k + 1] : 40;
+      for (let j = src + 1; j < next; j++) {
+        const p0 = [cx(src) + cw / 2, cy - ch / 2 - 4], p2 = [cx(j) + cw / 2, cy - ch / 2 - 4];
+        g.curve(p0, [(p0[0] + p2[0]) / 2, p0[1] - 10 - (j - src) * (narrow ? 2.5 : 3.5)], p2, { color: "memory", lw: 1.2, a: ka * 0.7 * (1 - 0.6 * yb), head: 6, prog: ramp(s.t % 5, (j - src) * 0.06, 0.5) });
+      }
+    });
+    // indexer sources below
+    IDX_SRC.forEach((src, k) => {
+      const next = k + 1 < IDX_SRC.length ? IDX_SRC[k + 1] : 40;
+      g.rect(cx(src) + 1, cy + ch / 2 + 26, cw - 3, 6, { fill: "net", r: 2, a: ka });
+      for (let j = src + 1; j < next; j++) g.line(cx(src) + cw / 2, cy + ch / 2 + 32, cx(j) + cw / 2, cy + ch / 2 + 32, { color: "net", lw: 1.5, a: ka * 0.4 });
+    });
+    g.text("KV source layers", cx(0), cy - ch / 2 - 18 - (yb > 0.5 ? 1000 : 0), { size: 13, color: "memory", a: ka * (1 - yb) });
+    g.text("shared indexer modules", cx(0), cy + ch / 2 + 56, { size: 13, color: "net", a: ka });
+    // YOCO projection arrow (beat 1)
+    if (yb > 0.01) {
+      const px = cx(SPLIT) - 2, py = cy + ch / 2 + 74;
+      g.curve([cx(SPLIT - 1) + cw / 2, cy + ch / 2 + 4], [cx(SPLIT - 1), py], [cx(28), py], { color: "memory", lw: 2.5, a: yb, head: 10 });
+      g.text("hidden state of the last early layer → KV for every consumer layer", narrow ? cx(0) : cx(SPLIT) - 120, py + 30, { size: 14, color: "memory", a: yb, weight: 600 });
+    }
+    // draft layers (beat 2)
+    if (dr > 0.01) {
+      const dx = x1 + (narrow ? 14 : 40);
+      for (let k = 0; k < 3; k++) {
+        g.rect(dx + k * (cw + 4), cy - ch / 2, cw, ch, { fill: "cpu", r: 2, a: 0.8 * dr });
+        [37, 38, 39].forEach((t) => g.curve([cx(t) + cw / 2, cy - ch / 2 - 2], [(cx(t) + dx) / 2 + k * 6, cy - ch / 2 - 60 - k * 8], [dx + k * (cw + 4) + cw / 2, cy - ch / 2 - 2], { color: "cpu", lw: 1, a: dr * 0.5, arrow: false }));
+      }
+      g.text("DFlash ×3", dx, cy + ch / 2 + 18, { size: 13, color: "cpu", weight: 600, a: dr });
+      g.text("reads 37–39", dx, cy + ch / 2 + 36, { size: 12, color: "ink-3", a: dr });
+    }
+    // consequences (beat 3)
+    if (cons > 0.01) {
+      const tags = [["EP + EPLB → 06", "compute"], ["state slot · replay → 04/08", "memory"], ["Engram gather → 10", "ok"], ["DSpark → 09", "cpu"]];
+      let tx = x0, ty = H - 92;
+      tags.forEach(([lab, c], i) => {
+        const a = cons * ramp(s.b, 2.4 + i * 0.12, 0.3);
+        const w = g.tw(lab, 14, "mono", 600) + 20;
+        if (tx + w > W - 30) { tx = x0; ty += 34; }
+        g.chip(tx, ty, lab, c, { a, size: 14 });
+        tx += w + 10;
+      });
+    }
+  }, { anim: true, restT: 3 });
+
+  /* ---------------- KV calculator ---------------- */
+  const fmtB = (b) => b >= 1e9 ? (b / 1e9).toFixed(1) + " GB" : b >= 1e6 ? (b / 1e6).toFixed(1) + " MB" : b >= 1e3 ? (b / 1e3).toFixed(1) + " KB" : Math.round(b) + " B";
+  Atlas.scene("kvcalc", (g, s) => {
+    const st = s.state; if (st.ratio === undefined) return;
+    const bits = st.bits, r = st.ratio, src = st.src;
+    const scaleMain = bits === 4 ? 512 / 16 : 0, scaleIdx = bits === 4 ? 128 / 32 : 0;
+    const knob = (src * (512 * bits / 8 + scaleMain) + src * (128 * bits / 8 + scaleIdx)) / r;
+    const ctx = 1024 * Math.pow(2, st.ctxk - 1);
+    document.getElementById("kv-tok").textContent = fmtB(knob).replace(" ", " ");
+    document.getElementById("kv-req").textContent = fmtB(knob * ctx + 1415040).replace(" ", " ");
+    const rows = [
+      ["MHA · GPT-3 175B", 96 * 96 * 128 * 2 * 2, "ink-3"],
+      ["GQA · Llama-3-70B", 80 * 8 * 128 * 2 * 2, "ink-3"],
+      ["MLA · DeepSeek-V3", 61 * 576 * 2, "compute"],
+      ["Knobs (V4.1 estimate)", knob, "memory"],
+    ];
+    const { W, H } = g;
+    const x0 = g.narrow ? 30 : 230, x1 = W - 40, y0 = 70;
+    const lmin = Math.log10(100), lmax = Math.log10(2e7);
+    const sx = (v) => x0 + (x1 - x0) * (Math.log10(Math.max(v, 100)) - lmin) / (lmax - lmin);
+    [100, 1e3, 1e4, 1e5, 1e6, 1e7].forEach((v) => { g.line(sx(v), y0 - 10, sx(v), y0 + rows.length * 74, { color: "grid" }); g.text(fmtB(v), sx(v), y0 - 18, { size: 12, color: "ink-3", align: "center" }); });
+    rows.forEach(([lab, v, c], i) => {
+      const y = y0 + 20 + i * 74;
+      if (g.narrow) g.text(lab, x0, y - 6, { size: 14, color: "ink-2", weight: 600 });
+      else g.text(lab, x0 - 14, y + 20, { size: 14, color: "ink-2", align: "right", weight: 600 });
+      g.rect(x0, y + (g.narrow ? 2 : 4), sx(v) - x0, 26, { fill: c, r: 4, a: c === "ink-3" ? 0.45 : 0.85 });
+      const inside = sx(v) + 190 > x1;
+      const lx = inside ? sx(v) - 8 : sx(v) + 8, al = inside ? "right" : "left";
+      g.text(fmtB(v) + "/token", lx, y + (g.narrow ? 21 : 23), { size: 13, color: inside ? "sheet" : "ink", weight: 600, align: al });
+      g.text("× " + (ctx / 1024) + "K tokens = " + fmtB(v * ctx), inside ? sx(v) : sx(v) + 8, y + (g.narrow ? 47 : 49), { size: 12, color: "ink-3", align: al });
+    });
+    const by = y0 + 20 + rows.length * 74 + 20;
+    g.text("plus a fixed sliding-window slot per request, independent of length:", 30, by, { size: 13, color: "ink-2" });
+    g.text("20 layers × 134 tokens × 528 B = 1.42 MB (MXFP8, from the deployment Q&A)", 30, by + 22, { size: 13, color: "memory", weight: 600 });
+    const ratio = (61 * 576 * 2) / knob;
+    g.text(`knob setting is ${ratio >= 1 ? ratio.toFixed(0) + "× smaller" : (1 / ratio).toFixed(1) + "× larger"} than V3's MLA per token`, 30, by + 52, { size: 15, color: "ink", weight: 600 });
+  }, { controls: "kv-ctl", format: (id, v) => id === "ctxk" ? (Math.pow(2, v - 1)) + "K" : String(v) });
+})();
+
+</script>
+<script>AtlasAlts.render("alts-model", "sources-model", "model");</script>
+</body>
+</html>

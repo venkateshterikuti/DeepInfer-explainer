@@ -1,0 +1,447 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Speculative decoding · DeepInfer Annotated</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&display=swap">
+<link rel="stylesheet" href="atlas.css">
+</head>
+<body>
+<header class="bar">
+  <div class="wrap">
+    <a class="brand" href="index.html"><b>DeepInfer</b><span>annotated</span></a>
+    <nav aria-label="Chapters">
+      <a class="num" href="loop.html" title="The generation loop">01</a>
+      <a class="num" href="model.html" title="The model it serves">02</a>
+      <a class="num" href="engine.html" title="Anatomy of the engine">03</a>
+      <a class="num" href="memory.html" title="KV memory">04</a>
+      <a class="num" href="scheduling.html" title="Scheduling a step">05</a>
+      <a class="num" href="parallelism.html" title="One model, many GPUs">06</a>
+      <a class="num" href="cluster.html" title="The cluster around it">07</a>
+      <a class="num" href="replay.html" title="Bounded replay">08</a>
+      <a class="num" href="speculation.html" aria-current="page" title="Speculative decoding">09</a>
+      <a class="num" href="kernels.html" title="Numbers and kernels">10</a>
+      <a class="num" href="sampling.html" title="Sampling, structure, determinism">11</a>
+      <a class="num" href="frontdoor.html" title="The front door">12</a>
+      <a class="num" href="measure.html" title="Measuring it">13</a>
+      <a href="index.html">Map</a>
+    </nav>
+  </div>
+  <div class="progress"></div>
+</header>
+<main>
+  <section class="hero">
+    <div class="wrap">
+      <div>
+        <span class="eyebrow"><span class="n">09</span> Speculation</span>
+        <h1>Guess, <em>then check</em></h1>
+        <p class="dek">Checking five tokens costs about as much as generating one, so a small drafter guesses ahead and the big model verifies. DeepInfer's DSpark adds a step: it decides, across the whole batch, which guesses are worth checking.</p>
+        <div class="files">
+          <span class="tag">models/mtp/dflash.py</span>
+          <span class="tag">csrc/engine/mtp_varlen.hpp</span>
+          <span class="tag">layers/sampler.py</span>
+          <span class="tag">worker/dflash_cuda_graph_runner.py</span>
+        </div>
+      </div>
+      <div class="board stage-card" data-stage="guess" data-label="Rows of requests, each with five dashed draft tokens and confidence bars; the scheduler draws a cut, verified drafts turn green or red, skipped drafts fade.">
+        <span class="ruler">5 drafts per request · one verify pass</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <div class="facts">
+        <div><b>5</b><span>draft tokens proposed per request per step</span></div>
+        <div><b>5.00 → 3.2–4.4</b><span>drafts verified per step, fixed vs confidence-scheduled</span></div>
+        <div><b>3.29 → 3.20</b><span>average accepted length: almost unchanged</span></div>
+        <div><b>+4–7%</b><span>throughput at ~60 sequences per rank (EP64 data)</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="basics">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Why it works</span>
+        <h2>Memory-bound steps have room for free tokens</h2>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">Spare compute</span><h4>Five tokens for the price of one</h4><p>A decode step is dominated by reading weights (chapter 01). Running the model over 6 positions instead of 1 reads the same weights, so it costs only a little more. Speculative decoding spends that spare math.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Draft and verify</span><h4>Guess cheaply, score in one pass</h4><p>A drafter proposes the next few tokens. The target model runs once over the last real token plus the drafts and produces its own probability at every position. Matching drafts are accepted; the first miss is replaced by a token from the target.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">No quality loss</span><h4>Accept with probability min(1, p ÷ q)</h4><p>Where the drafter's probability q for its token exceeds the target's p, accept only with probability p ÷ q; on rejection, sample from what's left of p after subtracting q. The output distribution is the target's (up to a tiny numerical guard term). DeepInfer's sampler implements this rule.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">The arithmetic</span><h4>Expected tokens per step</h4><p>If each draft is accepted with probability α independently, a step with γ drafts yields (1 − α<sup>γ+1</sup>) ÷ (1 − α) tokens on average. At α = 0.8 and γ = 5 that's about 3.7 tokens per step instead of 1.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="sdbasics" data-label="Step cost bars for 1 and 6 positions nearly equal; a draft row verified in one pass; target and draft probability bars with the accepted and residual regions; a curve of expected tokens per step against acceptance rate."><span class="ruler">one decode step</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="drafter">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">The drafter</span>
+        <h2>A block drafter with a sense of order</h2>
+        <p class="lede">The code calls it DFlash; the paper calls the system DSpark. Three draft layers with smaller MoEs sit on top of the target model.</p>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">Block drafting</span><h4>Five positions in one pass</h4><p>Instead of drafting one token at a time, the drafter fills a block of 5 positions in a single forward pass, conditioned on hidden states taken from target layers 37, 38 and 39. The drafter's key cache for real tokens is filled inside the target's forward pass, so the drafter needs no prefill pass of its own.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Markov head</span><h4>Each guess knows the one before it</h4><p>Parallel block drafters lose accuracy toward the end of the block, because later positions can't see earlier guesses. DSpark adds a sequential head with a low-rank (rank 256) transition from the previous draft token, recovering much of that decay.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Confidence head</span><h4>A calibrated guess about the guess</h4><p>For every draft position, a tiny linear head reads the drafter's hidden state and Markov embedding and outputs, through a sigmoid with a per-position temperature, the chance this draft will be accepted. Multiplying along the block gives each draft's <i>survival</i> probability.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="dflash" data-label="Target model layers 37 to 39 feeding three draft layers; a block of five draft positions filled at once; a chain of Markov links between consecutive drafts; confidence bars and their cumulative survival products."><span class="ruler">DFlash + Markov + confidence</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="schedule">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Confidence-scheduled verification</span>
+        <h2>Check the guesses that pay</h2>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">The waste</span><h4>Fixed length verifies hopeless drafts</h4><p>Verifying all 5 drafts for every request spends compute on positions that will almost surely be rejected, like the fifth draft after a low-confidence fourth. At large batch sizes that compute isn't free anymore.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">One queue</span><h4>Every draft slot in the batch, sorted</h4><p>The scheduler pools every (request, position) slot in the batch and sorts by survival probability. A request's later drafts always rank behind its earlier ones, because survival only falls along a block.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">The objective</span><h4>Maximize expected tokens per second</h4><p>Walking down the queue, each extra slot adds its survival probability to expected tokens and one row to the step, which costs time read from a measured step-time curve. The scheduler keeps the prefix with the highest expected tokens ÷ step time, then gives each request 1 + its admitted drafts.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Live calibration</span><h4>The curve updates itself</h4><p>The curve starts from profiling. At runtime, a median-of-medians over the last 5,000 steps fits one per-row slope, shared by all graph sizes, for how much slower real steps run than the profiled curve; the sampler's time is a 9-step median. Because of asynchronous scheduling, the total budget uses confidences from two steps back; per-request lengths are finalized on the GPU from last step's.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="queue" data-label="Draft slots from eight requests as a grid; the same slots sorted into one queue by survival probability; a curve of expected tokens per second against total step rows with its maximum marked; throughput gains by concurrency."><span class="ruler">batch-wide verify budget</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="lab">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Try it</span>
+        <h2>Spend the verify budget</h2>
+        <p class="lede">Twelve requests, five drafts each. Change how confident the drafter is and how expensive extra rows are, and compare three policies.</p>
+      </header>
+      <div class="lab">
+        <div class="controls" id="spec-ctl">
+          <div class="ctl"><label for="conf">Drafter confidence <output for="conf">0.80</output></label><input type="range" id="conf" min="0.3" max="0.97" step="0.01" value="0.8"></div>
+          <div class="ctl"><label for="spread">Spread between requests <output for="spread">0.15</output></label><input type="range" id="spread" min="0" max="0.4" step="0.01" value="0.15"></div>
+          <div class="ctl"><label for="rowcost">Cost of each extra row (% of a step) <output for="rowcost">2.0%</output></label><input type="range" id="rowcost" min="0" max="10" step="0.1" value="2"></div>
+          <div class="readout">
+            <div><b id="s-dyn">–</b><span>tok/step-time · scheduled</span></div>
+            <div><b id="s-fix">–</b><span>tok/step-time · fixed 5</span></div>
+          </div>
+          <p class="note">Survival = product of confidences along each request's block; scheduled = best prefix of the sorted queue. Throughput units are relative to a no-speculation step.</p>
+        </div>
+        <div class="board" data-stage="budget" data-label="Grid of 12 requests by 5 draft slots shaded by survival probability, admitted slots outlined; a chart of throughput against number of admitted slots with markers for no speculation, fixed 5 and the scheduled optimum."><span class="ruler">12 requests × 5 drafts</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="code">
+    <div class="wrap stack">
+      <header>
+        <span class="eyebrow">In the repo</span>
+        <h2>The scheduler loop</h2>
+      </header>
+      <div class="split">
+        <div class="code">
+          <div class="hd"><span>csrc/engine/mtp_varlen.hpp · MTPVarlen::schedule</span><a href="https://github.com/deepseek-ai/DeepInfer/blob/main/csrc/engine/mtp_varlen.hpp" target="_blank" rel="noopener">source</a></div>
+<pre><span class="k">auto</span> update_best = [&amp;]() {
+    <span class="c">// smallest captured graph that fits cur_bsz rows</span>
+    <span class="k">const auto</span> &amp;[graph_size, baseline_ms] = _decode_perf_curve[cur_bsz_idx];
+    <span class="k">const double</span> time_ms = baseline_ms + slope_ms * graph_size + sampler_ms;
+    <span class="k">const double</span> cur_throughput = cur_expected / time_ms;
+    <span class="k">if</span> (cur_throughput &gt; best_throughput) {
+        best_throughput = cur_throughput; best_bsz = cur_bsz;
+    }
+};
+update_best();                         <span class="c">// golden tokens only</span>
+<span class="k">for</span> (<span class="k">auto</span> &amp;acc : acc_queue_for_bsz) {   <span class="c">// sorted by survival</span>
+    cur_expected += acc.first; cur_bsz += <span class="n">1</span>; update_best();
+}
+seqlens_q.assign(num_seqs, <span class="n">1</span>);
+<span class="k">for</span> (<span class="k">int</span> i = <span class="n">0</span>; i &lt; best_bsz - num_seqs; ++i)
+    seqlens_q[acc_queue_for_seqs_q[i].second] += <span class="n">1</span>;</pre>
+        </div>
+        <div class="prose">
+          <p><b>Graph-aware.</b> Time is read from the captured CUDA graph size that would run, so adding one row that crosses into a bigger graph is charged the jump. The search doesn't stop at the first decline, so it can step past those jumps.</p>
+          <p><b>Two queues.</b> One, built from confidences two steps old, sets the total budget; the other, from last step's, decides which requests get the rows.</p>
+          <p><b>Grammar-aware.</b> With structured output on, the grammar matcher walks through the drafts to build a mask for each draft position, then rolls all of those steps back; next step it advances by the tokens actually accepted.</p>
+          <p><b>Opt-in.</b> Confidence-scheduled verification is off by default; <code>DEEPINFER_ENABLE_MTP_VARLEN=1</code> turns it on. Otherwise every request verifies all its drafts.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="others">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Other ways to do it</span>
+        <h2>How others draft and verify</h2>
+      </header>
+      <div class="compare" id="alts-speculation"></div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap"><div class="sources" id="sources-speculation"></div></div>
+  </section>
+
+</main>
+<nav class="next" aria-label="Chapter navigation">
+  <div class="wrap">
+    <a href="replay.html"><span>← Chapter 08</span><b>Bounded replay</b></a>
+    <a class="fwd" href="kernels.html"><span>Chapter 10 →</span><b>Numbers and kernels</b></a>
+  </div>
+</nav>
+<script src="atlas.js"></script>
+<script src="alts.js"></script>
+<script>
+(function () {
+  const { ramp, ease, clamp, lerp, rng } = Atlas;
+  function confMatrix(n, base, spread, seed) {
+    const R = rng(seed);
+    const M = [];
+    for (let i = 0; i < n; i++) {
+      const b = clamp(base + (R() - 0.5) * 2 * spread, 0.05, 0.99);
+      const row = []; let surv = 1;
+      for (let j = 0; j < 5; j++) { const c = clamp(b - 0.05 * j + (R() - 0.5) * 0.08, 0.02, 0.995); surv *= c; row.push({ c, surv, i, j }); }
+      M.push(row);
+    }
+    return M;
+  }
+  function bestPrefix(M, timeFn) {
+    const n = M.length;
+    const q = M.flat().sort((a, b) => b.surv - a.surv || a.i - b.i);
+    let exp = n, best = { k: 0, thr: n / timeFn(n) }, curve = [[0, n / timeFn(n)]];
+    q.forEach((slot, k) => { exp += slot.surv; const thr = exp / timeFn(n + k + 1); curve.push([k + 1, thr]); if (thr > best.thr) best = { k: k + 1, thr }; });
+    const admitted = new Set(q.slice(0, best.k).map((sl) => sl.i * 5 + sl.j));
+    const fixedExp = n + M.flat().reduce((a, sl) => a + sl.surv, 0);
+    return { q, best, curve, admitted, fixed: fixedExp / timeFn(n * 6) };
+  }
+
+  /* ---------------- hero ---------------- */
+  Atlas.scene("guess", (g, s) => {
+    const { W, H } = g;
+    const n = 6, M = confMatrix(n, 0.8, 0.15, 3);
+    const { admitted } = bestPrefix(M, (rows) => 1 + 0.025 * rows);
+    const cyc = 5, tt = s.t % cyc;
+    const R = rng(Math.floor(s.t / cyc) + 7);
+    const rh = (H - 80) / n, x0 = 120, cw = Math.min(70, (W - x0 - 40) / 5.4);
+    M.forEach((row, i) => {
+      const y = 50 + i * rh;
+      g.pill(30, y + rh / 2, "req " + (i + 1), { size: 13, color: "ink-2" });
+      let rejected = false;
+      row.forEach((sl, j) => {
+        const x = x0 + j * (cw + 8), a = ramp(tt, 0.1 + j * 0.12, 0.25);
+        const adm = admitted.has(i * 5 + j);
+        const h = (rh - 26) * sl.c;
+        g.rect(x + 8, y + rh - 22 - h, cw - 16, h, { fill: "memory", r: 2, a: a * 0.55 * (tt > 1.4 && !adm ? 0.3 : 1) });
+        let col = "cpu", fade = 1;
+        if (tt > 1.4 && !adm) fade = 0.25;
+        if (tt > 2.4 && adm) { const acc = !rejected && R() < sl.c; if (!acc) rejected = true; col = acc ? "ok" : "bad"; if (!acc && !rejected) col = "bad"; }
+        g.rect(x, y + rh - 18, cw, 14, { fill: col, r: 3, a: a * fade * 0.85 });
+      });
+      if (tt > 1.4) {
+        const k = [0, 1, 2, 3, 4].filter((j) => admitted.has(i * 5 + j)).length;
+        const cx = x0 + k * (cw + 8) - 4;
+        g.line(cx, y + 4, cx, y + rh - 2, { color: "ink", lw: 2, a: ramp(tt, 1.4, 0.3) });
+      }
+    });
+    g.text(tt < 1.4 ? "drafter proposes 5 per request" : tt < 2.4 ? "scheduler cuts where checking stops paying" : "one pass verifies: green accepted, red rejected", x0, H - 16, { size: 13, color: "ink-2" });
+  }, { anim: true, restT: 3.2, zoom: 1.0, minW: 560 });
+
+  /* ---------------- basics ---------------- */
+  Atlas.scene("sdbasics", (g, s) => {
+    const { W, H, narrow } = g;
+    const a0 = s.solo(0), a1 = s.solo(1), a2 = s.solo(2), a3 = s.solo(3);
+    if (a0 > 0.01) {
+      [["1 position", 1], ["1 + 5 drafts", 6]].forEach(([lab, k], i) => {
+        const y = 90 + i * 150, x0 = 40, w = W - 120;
+        g.text(lab, x0, y - 12, { size: 18, font: "display", weight: 800, color: "ink", a: a0 });
+        g.rect(x0, y, w * 0.82, 34, { fill: "memory", r: 4, a: a0 * 0.85 });
+        g.text("read weights", x0 + 10, y + 22, { size: 13, color: "sheet", weight: 600, a: a0 });
+        g.rect(x0 + w * 0.82 + 4, y, w * 0.025 * k, 34, { fill: "compute", r: 4, a: a0 * 0.9 });
+        g.text("math", x0 + w * 0.82 + 8 + w * 0.025 * k, y + 22, { size: 13, color: "compute", a: a0 });
+      });
+      g.text("≈ same step time; 6× the chances to produce a token", 40, 400, { size: 16, color: "ok", weight: 600, a: a0 });
+    }
+    if (a1 > 0.01) {
+      const y = 140; let x = 40;
+      ["…", "the", "cat", "sat"].forEach((t) => { x += g.pill(x, y, t, { size: 16, a: a1, color: "ink-2" }) + 8; });
+      const drafts = ["on", "the", "warm", "mat", "and"], res = ["ok", "ok", "ok", "bad", "ink-3"];
+      const vx0 = x;
+      drafts.forEach((t, j) => { const ph = ramp(s.t % 4, 0.8 + j * 0.15, 0.3); const c = ph > 0.5 ? res[j] : "cpu"; x += g.pill(x, y, t, { size: 16, a: a1, color: c, stroke: c, dash: [5, 4] }) + 8; });
+      g.box(40, y + 40, x - 40, 46, { color: "compute", title: "target model · one pass over all positions", tsize: 14, tfont: "mono", tweight: 600, a: a1 });
+      g.pill(vx0 + 3 * 60, y + 130, "purred", { size: 16, color: "ok", stroke: "ok", a: a1 * ramp(s.t % 4, 1.8, 0.3) });
+      g.text("first miss replaced by the target's own sample", vx0, y + 172, { size: 13, color: "ok", a: a1 });
+      g.text("3 accepted + 1 corrected = 4 tokens in one step", 40, y + 220, { size: 16, color: "ink", weight: 600, a: a1 });
+    }
+    if (a2 > 0.01) {
+      const toks = ["warm", "soft", "mat", "rug", "bed", "…"];
+      const p = [0.18, 0.12, 0.34, 0.16, 0.12, 0.08], q = [0.42, 0.10, 0.20, 0.10, 0.10, 0.08];
+      const x0 = 70, y0 = 90, bw = (W - 140) / toks.length, hmax = H * 0.36;
+      toks.forEach((t, i) => {
+        const x = x0 + i * bw;
+        g.rect(x + 6, y0 + hmax - hmax * p[i] / 0.45, bw / 2 - 8, hmax * p[i] / 0.45, { fill: "compute", r: 3, a: a2 * 0.85 });
+        g.rect(x + bw / 2, y0 + hmax - hmax * q[i] / 0.45, bw / 2 - 8, hmax * q[i] / 0.45, { fill: "cpu", r: 3, a: a2 * 0.6 });
+        g.text(t, x + bw / 2, y0 + hmax + 20, { size: 13, color: i === 0 ? "ink" : "ink-3", align: "center", weight: i === 0 ? 600 : 500, a: a2 });
+      });
+      g.chip(x0, y0 - 30, "p · target", "compute", { a: a2, size: 13 });
+      g.chip(x0 + 140, y0 - 30, "q · drafter", "cpu", { a: a2, size: 13 });
+      const ty = y0 + hmax + 60;
+      g.text("drafter picked 'warm': q = 0.42 > p = 0.18", 40, ty, { size: 15, color: "ink", weight: 600, a: a2 });
+      g.text("accept with probability p ÷ q = 0.43; otherwise resample from max(0, p − q)", 40, ty + 26, { size: 14, color: "ink-2", a: a2 });
+      g.text("result: tokens are distributed exactly as the target would sample them", 40, ty + 52, { size: 14, color: "ok", weight: 600, a: a2 });
+    }
+    if (a3 > 0.01) {
+      const E = (al) => (1 - Math.pow(al, 6)) / (1 - al);
+      const pts = []; for (let al = 0; al < 0.995; al += 0.02) pts.push([al, E(al)]);
+      g.chart({ x0: 100, y0: 80, x1: W - 50, y1: H - 110, xmax: 1, ymax: 6, xticks: [0, 0.2, 0.4, 0.6, 0.8, 1], yticks: [1, 2, 3, 4, 5, 6], fx: (v) => v.toFixed(1),
+        xlabel: "per-draft acceptance α", ylabel: "tokens per step (γ = 5)", series: [{ pts, color: "compute", dots: false, area: true }], a: a3, tsize: 13, ylabelOff: 56 });
+      const x = 100 + (W - 150) * 0.8, y = (H - 110) - (H - 190) * E(0.8) / 6;
+      g.circle(x, y, 8, { fill: "ok", stroke: "sheet", lw: 2, a: a3 });
+      g.callout(x, y, x - 160, y - 60, "α = 0.8 → 3.69 tokens", { color: "ok", a: a3, left: true });
+    }
+  }, { anim: true, restT: 2.5 });
+
+  /* ---------------- drafter ---------------- */
+  Atlas.scene("dflash", (g, s) => {
+    const { W, H, narrow } = g;
+    const lx = 40, ly = 64, lw = narrow ? 34 : 44, lh = H * 0.24;
+    // target layers 34..39
+    for (let k = 0; k < 6; k++) {
+      const l = 34 + k, tgt = l >= 37;
+      g.rect(lx + k * (lw + 6), ly, lw, lh, { fill: "memory", r: 3, a: tgt ? 0.9 : 0.3 });
+      g.text(String(l), lx + k * (lw + 6) + lw / 2, ly + lh + 18, { size: 12, color: "ink-3", align: "center" });
+    }
+    g.text("target layers", lx, ly - 12, { size: 13, color: "ink-3" });
+    const dx = lx + 6 * (lw + 6) + 60, dw = W - dx - 40;
+    g.box(dx, ly, dw, lh, { color: "cpu", title: "DFlash drafter", sub: "3 layers · 128 experts, top-3", tsize: 22, ssize: 13 });
+    for (let k = 3; k < 6; k++) g.curve([lx + k * (lw + 6) + lw / 2, ly + 10], [(lx + k * (lw + 6) + dx) / 2, ly - 30], [dx, ly + 24 + (k - 3) * 18], { color: "cpu", lw: 1.5, a: 0.7, head: 8 });
+    // drafts
+    const y = ly + lh + 56, n = 5, bw = Math.min(110, (W - 120) / 5.6);
+    g.curve([dx + dw / 2, ly + lh], [dx + dw / 2, y - 10], [60 + 2.5 * (bw + 14), y - 4], { color: "cpu", lw: 1.5, a: 0.5, head: 8 });
+    const conf = [0.94, 0.86, 0.72, 0.41, 0.2];
+    let surv = 1;
+    const mk = s.at(1), cf = s.at(2);
+    const cb = y + clamp(H * 0.32, 196, 250);
+    for (let j = 0; j < n; j++) {
+      const x = 60 + j * (bw + 14);
+      const appear = ramp(s.t % 4, 0.4, 0.3);
+      g.rect(x, y, bw, 42, { fill: "sheet", stroke: "cpu", lw: 2, dash: [5, 4], r: 6, a: appear });
+      g.text("d" + (j + 1), x + bw / 2, y + 27, { size: 15, color: "cpu", align: "center", weight: 600, a: appear });
+      if (j > 0 && mk > 0.01) g.curve([x - 14 - bw / 2, y + 44], [x - 7, y + 80], [x + bw / 2 - 6, y + 46], { color: "net", lw: 2, a: mk, head: 8 });
+      surv *= conf[j];
+      if (cf > 0.01) {
+        const h = 70 * conf[j];
+        g.rect(x + bw * 0.2, cb - h, bw * 0.6, h, { fill: "memory", r: 3, a: cf * 0.8 });
+        g.text(conf[j].toFixed(2), x + bw / 2, cb - h - 8, { size: 13, color: "memory", align: "center", weight: 600, a: cf });
+        g.text(surv.toFixed(2), x + bw / 2, cb + 28, { size: 16, color: surv > 0.5 ? "ok" : surv > 0.2 ? "ink" : "bad", align: "center", weight: 700, a: cf });
+      }
+    }
+    const rx = 60 + 5 * (bw + 14);
+    if (s.solo(0) > 0.01) g.text("all five positions come out of one forward pass", 60, y + 80, { size: 14, color: "ink-2", a: s.solo(0) });
+    if (mk > 0.01) g.text("Markov head: low-rank (256) link from the previous draft", 60, y + 100, { size: 14, color: "net", weight: 600, a: mk });
+    if (cf > 0.01) {
+      g.line(50, cb, rx - 10, cb, { color: "ink-3", a: cf * 0.6 });
+      g.text("confidence", rx, cb - 40, { size: 13, color: "memory", weight: 600, a: cf });
+      g.text("survival", rx, cb + 28, { size: 13, color: "ink", weight: 600, a: cf });
+      g.text("= product so far", rx, cb + 46, { size: 12, color: "ink-3", a: cf });
+    }
+  }, { anim: true, restT: 1.5 });
+
+  /* ---------------- batch-wide queue ---------------- */
+  const GAINS = [[16, -1.5], [32, 1.6], [48, 3.6], [60, 5.4], [72, 6.7], [96, 11.0]];
+  Atlas.scene("queue", (g, s) => {
+    const { W, H, narrow } = g;
+    const n = 8, M = confMatrix(n, 0.78, 0.18, 11);
+    const timeFn = (rows) => 1 + 0.03 * rows;
+    const r = bestPrefix(M, timeFn);
+    const gx = 40, gy = 70, cw = narrow ? 44 : 56, ch = 30;
+    const sortA = s.at(1), objA = s.at(2), resA = s.swapIn(3), mainA = s.swapOut(3);
+    if (mainA > 0.01) {
+      const rank = new Map(r.q.map((sl, k) => [sl.i * 5 + sl.j, k]));
+      const qy = gy + n * (ch + 6) + 70, qcw = (W - 80) / 40;
+      M.forEach((row, i) => row.forEach((sl, j) => {
+        const k = rank.get(i * 5 + j);
+        const gxp = gx + 60 + j * (cw + 6), gyp = gy + i * (ch + 6);
+        const qxp = 40 + k * qcw, qyp = qy;
+        const x = lerp(gxp, qxp, sortA), y = lerp(gyp, qyp, sortA), w = lerp(cw, qcw - 2, sortA);
+        const adm = r.admitted.has(i * 5 + j);
+        const col = Atlas.mixc("bad", "ok", sl.surv);
+        g.rect(x, y, w, ch, { fill: col, r: 3, a: mainA * (objA > 0.5 && !adm ? 0.25 : 0.85) });
+        if (s.b < 0.5 && sortA < 0.1) g.rect(x, y, w, ch, { stroke: "ink-3", lw: 1, r: 3, a: mainA });
+        if (sortA < 0.5) g.text(sl.surv.toFixed(2), x + w / 2, y + 20, { size: 11, color: "sheet", align: "center", weight: 600, a: mainA * (1 - sortA * 2) });
+      }));
+      if (sortA < 0.5) for (let i = 0; i < n; i++) g.text("req " + (i + 1), gx, gy + i * (ch + 6) + 20, { size: 12, color: "ink-3", a: mainA * (1 - sortA * 2) });
+      if (s.solo(0) > 0.01) g.text("fixed-5 verifies every slot, including the red ones", gx, gy + n * (ch + 6) + 24, { size: 14, color: "bad", weight: 600, a: s.solo(0) });
+      if (sortA > 0.5) g.text("one queue, sorted by survival probability →", 40, qy - 14, { size: 13, color: "ink-2", a: mainA * sortA });
+      if (objA > 0.01) {
+        const cutX = 40 + r.best.k * qcw;
+        g.line(cutX, qy - 30, cutX, qy + ch + 12, { color: "ink", lw: 2.5, a: objA * mainA });
+        const cx0 = 90, cy0 = gy, cx1 = W - 40, cy1 = qy - 50;
+        const mx = Math.max(...r.curve.map((p) => p[1]));
+        g.chart({ x0: cx0, y0: cy0, x1: cx1, y1: cy1, xmax: 40, ymax: mx * 1.15, xmin: 0, ymin: 0, xticks: [0, 10, 20, 30, 40], yticks: [], series: [{ pts: r.curve, color: "compute", dots: false }], a: objA * mainA, tsize: 12, xlabel: "", ylabel: "expected tokens ÷ step time", ylabelOff: 40 });
+        const bx = cx0 + (cx1 - cx0) * r.best.k / 40, by = cy1 - (cy1 - cy0) * r.best.thr / (mx * 1.15);
+        g.circle(bx, by, 8, { fill: "ok", stroke: "sheet", lw: 2, a: objA * mainA });
+        g.text(`best: ${r.best.k} of 40 drafts`, bx + 12, by - 10, { size: 14, color: "ok", weight: 600, a: objA * mainA });
+      }
+    }
+    if (resA > 0.01) {
+      const bx0 = 60, zero = H - 120, bw = (W - 120) / 6;
+      g.text("throughput gain vs fixed-5, by sequences per rank (EP64 benchmark)", bx0, 70, { size: 14, color: "ink", weight: 600, a: resA });
+      g.line(bx0, zero, W - 60, zero, { color: "ink-3", a: resA });
+      GAINS.forEach(([c, v], i) => {
+        const x = bx0 + i * bw, h = v * 22;
+        g.rect(x + 10, zero - Math.max(h, 0), bw - 20, Math.abs(h), { fill: v > 0 ? "ok" : "bad", r: 4, a: resA * 0.85 });
+        g.text((v > 0 ? "+" : "") + v.toFixed(1) + "%", x + bw / 2, v > 0 ? zero - h - 10 : zero + Math.abs(h) + 18, { size: 14, color: v > 0 ? "ok" : "bad", align: "center", weight: 700, a: resA });
+        g.text(String(c), x + bw / 2, zero + 72, { size: 13, color: i === 3 ? "ink" : "ink-3", align: "center", weight: i === 3 ? 700 : 500, a: resA });
+      });
+      g.text("sequences per rank →", W - 60, zero + 96, { size: 12, color: "ink-3", align: "right", a: resA });
+      g.text("production operating point ≈ 60", bx0, zero + 96, { size: 13, color: "ink-2", a: resA });
+    }
+  }, { anim: false });
+
+  /* ---------------- budget lab ---------------- */
+  Atlas.scene("budget", (g, s) => {
+    const st = s.state; if (st.conf === undefined) return;
+    const n = 12, M = confMatrix(n, st.conf, st.spread, 5);
+    const timeFn = (rows) => 1 + (st.rowcost / 100) * (rows - n);
+    const r = bestPrefix(M, timeFn);
+    const none = n / timeFn(n);
+    document.getElementById("s-dyn").textContent = (r.best.thr / none).toFixed(2) + "×";
+    document.getElementById("s-fix").textContent = (r.fixed / none).toFixed(2) + "×";
+    const { W, H } = g;
+    const gx = 40, gy = 40, cw = Math.min(44, (W * 0.42 - 60) / 5), ch = Math.min(26, (H - 80) / n - 4);
+    M.forEach((row, i) => row.forEach((sl, j) => {
+      const x = gx + 30 + j * (cw + 4), y = gy + i * (ch + 4);
+      const adm = r.admitted.has(i * 5 + j);
+      if (adm) {
+        g.rect(x, y, cw, ch, { fill: "ok", r: 3, a: 0.25 + 0.7 * sl.surv });
+        g.rect(x, y, cw, ch, { stroke: "ok", lw: 1.5, r: 3 });
+      } else g.rect(x, y, cw, ch, { stroke: "bad", lw: 1, dash: [3, 3], r: 3, a: 0.5 });
+      if (cw >= 34) g.text(sl.surv.toFixed(2).slice(1), x + cw / 2, y + ch * 0.68, { size: 10, color: adm && sl.surv > 0.45 ? "sheet" : "ink-3", align: "center", weight: 600 });
+    }));
+    for (let i = 0; i < n; i++) g.text(String(i + 1), gx + 20, gy + i * (ch + 4) + ch * 0.7, { size: 11, color: "ink-3", align: "right" });
+    const ly2 = gy + n * (ch + 4) + 20;
+    g.text("solid: verified · dashed: skipped", gx + 30, ly2, { size: 11, color: "ink-3" });
+    g.text("number: survival probability", gx + 30, ly2 + 16, { size: 11, color: "ink-3" });
+    const cx0 = gx + 30 + 5 * (cw + 4) + 70, cx1 = W - 30, cy0 = 50, cy1 = H - 70;
+    const mx = Math.max(...r.curve.map((p) => p[1]), none) * 1.1;
+    g.chart({ x0: cx0, y0: cy0, x1: cx1, y1: cy1, xmax: 60, ymax: mx, xticks: [0, 20, 40, 60], yticks: [], series: [{ pts: r.curve, color: "compute", dots: false }], tsize: 12, xlabel: "drafts admitted (sorted)", ylabel: "throughput", ylabelOff: 30 });
+    const sx = (k) => cx0 + (cx1 - cx0) * k / 60, sy = (v) => cy1 - (cy1 - cy0) * v / mx;
+    g.circle(sx(0), sy(none), 6, { fill: "ink-3" }); g.text("no speculation", sx(0) + 10, sy(none) + 18, { size: 12, color: "ink-3" });
+    g.circle(sx(60), sy(r.fixed), 7, { fill: "bad" }); g.text("fixed 5", sx(60) - 10, sy(r.fixed) - 12, { size: 12, color: "bad", align: "right", weight: 600 });
+    g.circle(sx(r.best.k), sy(r.best.thr), 8, { fill: "ok", stroke: "sheet", lw: 2 }); g.text("scheduled", sx(r.best.k), sy(r.best.thr) - 14, { size: 12, color: "ok", align: "center", weight: 600 });
+  }, { controls: "spec-ctl", format: (id, v) => id === "rowcost" ? v.toFixed(1) + "%" : v.toFixed(2) });
+})();
+
+</script>
+<script>AtlasAlts.render("alts-speculation", "sources-speculation", "speculation");</script>
+</body>
+</html>

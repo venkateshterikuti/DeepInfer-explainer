@@ -1,0 +1,577 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>The generation loop · DeepInfer Annotated</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&display=swap">
+<link rel="stylesheet" href="atlas.css">
+</head>
+<body>
+<header class="bar">
+  <div class="wrap">
+    <a class="brand" href="index.html"><b>DeepInfer</b><span>annotated</span></a>
+    <nav aria-label="Chapters">
+      <a class="num" href="loop.html" aria-current="page" title="The generation loop">01</a>
+      <a class="num" href="model.html" title="The model it serves">02</a>
+      <a class="num" href="engine.html" title="Anatomy of the engine">03</a>
+      <a class="num" href="memory.html" title="KV memory">04</a>
+      <a class="num" href="scheduling.html" title="Scheduling a step">05</a>
+      <a class="num" href="parallelism.html" title="One model, many GPUs">06</a>
+      <a class="num" href="cluster.html" title="The cluster around it">07</a>
+      <a class="num" href="replay.html" title="Bounded replay">08</a>
+      <a class="num" href="speculation.html" title="Speculative decoding">09</a>
+      <a class="num" href="kernels.html" title="Numbers and kernels">10</a>
+      <a class="num" href="sampling.html" title="Sampling, structure, determinism">11</a>
+      <a class="num" href="frontdoor.html" title="The front door">12</a>
+      <a class="num" href="measure.html" title="Measuring it">13</a>
+      <a href="index.html">Map</a>
+    </nav>
+  </div>
+  <div class="progress"></div>
+</header>
+<main>
+  <section class="hero">
+    <div class="wrap">
+      <div>
+        <span class="eyebrow"><span class="n">01</span> First principles</span>
+        <h1>One token <em>at a time</em></h1>
+        <p class="dek">Every answer a language model gives is a loop: run the model, pick one token, append it, run it again. Everything in DeepInfer exists because of what that loop costs.</p>
+        <div class="files">
+          <span class="tag">deepinfer/entrypoints/llm.py</span>
+          <span class="tag">deepinfer/engine/llm_engine.py</span>
+          <span class="tag">model_executor/layers/sampler.py</span>
+        </div>
+      </div>
+      <div class="board stage-card" data-stage="hero" data-label="A sentence being generated token by token, with faint alternative tokens the model considered at each position.">
+        <span class="ruler">decode trace · tokens/step = 1</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="loop">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">The loop</span>
+        <h2>A model is a function you call over and over</h2>
+        <p class="lede">Scroll through the four ideas that every inference engine is built on.</p>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">Step 1 · the function</span><h4>Tokens in, probabilities out</h4><p>A prompt is split into tokens. The model reads them and returns one score for every entry in its vocabulary. DeepSeek V4.1 Flash has 129,280 of them, so each call ends in 129,280 numbers.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Step 2 · sampling</span><h4>Pick one</h4><p>The sampler turns the scores into probabilities, applies temperature and top-k / top-p filters, and draws one token. That token is the only thing this whole forward pass produced.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Step 3 · the loop</span><h4>Append it and call again</h4><p>The new token joins the sequence and the model runs again. A 1,000-token answer is 1,000 trips around this loop. In DeepInfer the loop lives in <code>LLM._run_engine</code>, which calls <code>engine.step()</code> until no request is left.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Step 4 · two phases</span><h4>Prefill once, decode many times</h4><p>The first call is different: the whole prompt goes through in one pass. That is <b>prefill</b>, and it is heavy on math. Every later call adds one token. That is <b>decode</b>, it repeats for every output token, and it is where most serving time goes.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="loop" data-label="Diagram of the generation loop: token row, model, probability bars, chosen token returning to the row; a timeline of one prefill step followed by many decode steps."><span class="ruler">the generation loop</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="kv">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">The KV cache</span>
+        <h2>Remembering the past costs memory</h2>
+        <p class="lede">Attention is what lets a token use its context. Making it cheap is why every engine keeps a cache.</p>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">Attention</span><h4>Each new token looks back</h4><p>When the model processes the newest token, its <i>query</i> is compared with every earlier token to decide what matters. Every earlier token has to be available.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Keys and values</span><h4>Every token leaves two vectors per layer</h4><p>Each token produces a <i>key</i> (what it offers) and a <i>value</i> (what it contributes) in every layer. Those vectors depend only on the token and what came before it, so they never change.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">The cache</span><h4>Compute once, read forever</h4><p>Recomputing every key and value at every step would make an answer of length <i>n</i> cost on the order of <i>n</i>² token passes. Storing them makes each step compute only the new token and read the rest back. That store is the <b>KV cache</b>.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">The constraint</span><h4>The cache decides the batch</h4><p>GPU memory holds the model weights and every running request's cache. Free memory divided by KV per request is how many requests can run together. Chapters 04 and 08 are about stretching that number.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="kv" data-label="Diagram: attention arcs from the newest token to earlier tokens; key and value vectors stacked under each token per layer; memory bar filling with per-request KV caches."><span class="ruler">attention · per layer</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="wall">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">The memory wall</span>
+        <h2>Decode waits on memory, not on math</h2>
+        <p class="lede">This one fact explains batching, expert parallelism, speculative decoding and most of the rest of the engine.</p>
+      </header>
+      <div class="scrolly" data-scrolly>
+        <div class="beats">
+          <div class="beat"><div class="card"><span class="k">Bytes</span><h4>Every step reads the weights</h4><p>To produce the next token, the GPU streams the weights it needs from HBM into its compute units. On an SM100-class GPU that link moves on the order of 8 TB per second.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">FLOPs per byte</span><h4>One request leaves the GPU idle</h4><p>Each weight byte fetched for a single token does about 2 floating-point operations. The compute units could do several hundred per byte in the same time, so with one request they mostly wait.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">Batching</span><h4>Share the read</h4><p>If 64 requests take a step together, each weight byte serves 64 tokens. The step takes about as long, but produces 64 times the output. Batching is the cheapest speedup in inference.</p></div></div>
+          <div class="beat"><div class="card"><span class="k">The trade-off</span><h4>Throughput against speed per user</h4><p>Bigger batches make each step slower, so each user sees fewer tokens per second. DeepInfer's own benchmark spans about 325 tokens/s per user at 8 requests per GPU to about 26,000 tokens/s per GPU at 256.</p></div></div>
+        </div>
+        <div class="stick"><div class="board" data-stage="wall" data-label="Diagram: HBM feeding compute units through a bandwidth-limited link; utilization at batch 1 versus batch 64; then the decode throughput versus per-user speed curve from DeepInfer's benchmark."><span class="ruler">one decode step</span></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="lab">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Try it</span>
+        <h2>Roofline of a decode step</h2>
+        <p class="lede">Move the batch size and context length. Watch which wall the step hits: the bandwidth wall, where the GPU waits for bytes, or the compute wall, where it finally runs out of math.</p>
+      </header>
+      <div class="lab">
+        <div class="controls" id="roof-ctl">
+          <div class="ctl"><label for="batch">Requests in the batch <output for="batch">64</output></label><input type="range" id="batch" min="0" max="10" step="0.01" value="6"></div>
+          <div class="ctl"><label for="ctx">Context per request (tokens) <output for="ctx">32K</output></label><input type="range" id="ctx" min="10" max="17" step="0.01" value="15"></div>
+          <div class="ctl"><label for="wgb">Weights read per step (GB) <output for="wgb">12</output></label><input type="range" id="wgb" min="2" max="40" step="1" value="12"></div>
+          <div class="ctl"><label for="kvb">KV bytes per token <output for="kvb">0.6 KB</output></label><input type="range" id="kvb" min="0.1" max="8" step="0.1" value="0.6"></div>
+          <div class="readout" id="roof-out">
+            <div><b id="o-step">–</b><span>ms per step</span></div>
+            <div><b id="o-user">–</b><span>tok/s per user</span></div>
+            <div><b id="o-gpu">–</b><span>tok/s per GPU</span></div>
+            <div><b id="o-util">–</b><span>compute used</span></div>
+          </div>
+          <p class="note">Illustrative GPU: 8 TB/s of HBM bandwidth and 4.5 PFLOP/s of dense FP8 math. Weights and KV sizes are knobs, not V4.1's published figures; V4.1 compresses KV heavily, so its real per-token KV is small.</p>
+        </div>
+        <div class="board" data-stage="roof" data-label="Roofline chart: achieved FLOPs per second versus arithmetic intensity, with the current step marked; bars show time spent reading weights, reading KV, and computing."><span class="ruler">roofline · one GPU</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="batching">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Continuous batching</span>
+        <h2>Refill the batch every step</h2>
+        <p class="lede">Requests finish at different times. If the batch waits for its slowest member, the freed slots sit empty. Scheduling at every step fixes that, and every modern engine does it.</p>
+      </header>
+      <figure>
+        <div class="board fig-board" data-stage="cb" data-label="Two timelines of eight batch slots. Static batching leaves slots idle until the whole batch finishes; continuous batching starts a waiting request in a slot the step after it frees."><span class="ruler">8 batch slots · time →</span></div>
+        <figcaption>Top: static batching waits for the longest request before admitting new ones, so finished slots idle (hatched). Bottom: iteration-level scheduling, first described in the Orca paper and used by vLLM, SGLang, TensorRT-LLM and DeepInfer, admits a waiting request as soon as a slot frees.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section class="section" id="deepinfer">
+    <div class="wrap stack">
+      <header>
+        <span class="eyebrow">In the repo</span>
+        <h2>Where the loop lives</h2>
+      </header>
+      <div class="split">
+        <div class="prose">
+          <p>The offline entry point is the <code>LLM</code> class. <code>generate()</code> tokenizes prompts, hands each one to <code>LLMEngine.add_request</code>, then spins <code>_run_engine</code>: call <code>step()</code>, collect outputs, stop when nothing is left.</p>
+          <p>Each <code>step()</code> is one trip around the loop for <i>every</i> running request at once. It asks the C++ scheduler which sequences run, sends that batch to the GPU workers, samples, and returns finished outputs. Chapter 03 opens that step up.</p>
+          <p>One detail is already visible here: when no request is unfinished, the loop calls <code>flush_inflight_reqs()</code>. With asynchronous scheduling turned on, the last step's results are still in flight when the loop thinks it is done. Chapter 05 explains why.</p>
+        </div>
+        <div class="code">
+          <div class="hd"><span>deepinfer/entrypoints/llm.py · _run_engine</span><a href="https://github.com/deepseek-ai/DeepInfer/blob/main/deepinfer/entrypoints/llm.py" target="_blank" rel="noopener">source</a></div>
+<pre><span class="k">while</span> True:
+    unfinished = self.llm_engine.has_unfinished_requests()
+    step_outputs = (self.llm_engine.step() <span class="k">if</span> unfinished
+                    <span class="k">else</span> self.llm_engine.flush_inflight_reqs())
+    <span class="k">for</span> raw_output <span class="k">in</span> step_outputs:
+        <span class="c"># outputs are pooled; copy before the next step frees them</span>
+        output = RequestOutput.clone(raw_output)
+        outputs[output.request_id].append(output)
+    <span class="k">if not</span> unfinished:
+        <span class="k">break</span></pre>
+        </div>
+      </div>
+      <div class="facts">
+        <div><b>129,280</b><span>vocabulary entries scored per sampled token</span></div>
+        <div><b>1 step</b><span>per prompt chunk in prefill</span></div>
+        <div><b>1 step</b><span>per output token in decode (fewer with speculation, ch. 09)</span></div>
+        <div><b>~2</b><span>FLOPs per weight byte per token: why decode is memory-bound</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="others">
+    <div class="wrap">
+      <header>
+        <span class="eyebrow">Other ways to do it</span>
+        <h2>Same loop, different engines</h2>
+        <p class="lede">The loop itself is universal. Engines differ in where its bookkeeping runs and how much of it hides behind the GPU.</p>
+      </header>
+      <div class="compare" id="alts-loop"></div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap"><div class="sources" id="sources-loop"></div></div>
+  </section>
+
+</main>
+<nav class="next" aria-label="Chapter navigation">
+  <div class="wrap">
+    <a href="index.html"><span>← Map</span><b>The whole machine</b></a>
+    <a class="fwd" href="model.html"><span>Chapter 02 →</span><b>The model it serves</b></a>
+  </div>
+</nav>
+<script src="atlas.js"></script>
+<script src="alts.js"></script>
+<script>
+(function () {
+  const { ramp, ease, eout, clamp, lerp, win, rng } = Atlas;
+
+  /* ---------------- hero: a sentence being written ---------------- */
+  const SENT = "To serve a model at scale you batch requests , cache their past , and keep every GPU busy .".split(" ");
+  const ALTS = [["When", "If"], ["run", "host"], ["the", "this"], ["LLM", "network"], ["for", "with"], ["millions", "speed"], ["they", "one"], ["group", "queue"], ["tokens", "users"], [";", "and"], ["store", "reuse"], ["your", "the"], ["context", "keys"], [";", "then"], ["make", "let"], ["all", "each"], ["chip", "core"], ["fed", "full"], ["!", ";"]];
+  Atlas.scene("hero", (g, s) => {
+    const { W, H } = g;
+    const size = g.narrow ? 30 : 34, lh = size * 2.3, x0 = 40, maxX = W - 40;
+    const per = 0.42, total = SENT.length;
+    const cyc = total * per + 3.2;
+    const tt = s.t % cyc;
+    const n = Math.min(total, Math.floor(tt / per) + 1);
+    let x = x0, y = 96;
+    const pos = [];
+    for (let i = 0; i < total; i++) {
+      const w = g.tw(SENT[i], size, "body", 500);
+      if (x + w > maxX) { x = x0; y += lh; }
+      pos.push([x, y, w]); x += w + g.tw(" ", size, "body", 500) * 1.2;
+    }
+    for (let i = 0; i < n; i++) {
+      const [px, py, w] = pos[i];
+      const age = tt - i * per;
+      const a = ramp(age, 0, 0.18);
+      const fresh = 1 - ramp(age, 0.15, 0.7);
+      if (fresh > 0.02 && ALTS[i]) {
+        ALTS[i].forEach((alt, k) => g.text(alt, px + 6 * (k + 1), py + 22 + k * 20, { size: 15, font: "mono", color: "ink-3", a: fresh * 0.7 }));
+      }
+      g.text(SENT[i], px, py, { size, font: "body", weight: 500, color: Atlas.mixc("compute", "ink", ramp(age, 0.1, 0.6)), a });
+    }
+    if (n < total) { const [px, py] = pos[n]; g.rect(px, py - size * 0.8, 3, size, { fill: "compute", a: 0.5 + 0.5 * Math.sin(s.t * 8) }); }
+    // step trace at bottom
+    const ty = H - 70, tx0 = 40, tx1 = W - 40, cols = 36;
+    g.text("forward passes", tx0, ty - 14, { size: 14, color: "ink-3" });
+    for (let k = 0; k < cols; k++) {
+      const filled = k < n + 1;
+      const isPre = k === 0;
+      const cw = (tx1 - tx0) / cols;
+      g.rect(tx0 + k * cw, ty, isPre ? cw * 0.92 : cw * 0.6, 26, { fill: isPre ? "compute" : "memory", r: 3, a: filled ? 0.85 : 0.12 });
+    }
+    g.text("prefill", tx0, ty + 46, { size: 13, color: "compute" });
+    g.text("decode, one token per pass →", tx0 + 76, ty + 46, { size: 13, color: "memory" });
+  }, { anim: true, restT: 6.2, zoom: 1.0, minW: 520 });
+
+  /* ---------------- the loop ---------------- */
+  const PROMPT = ["The", "cat", "sat", "on"];
+  const GEN = ["the", "mat", ",", "purring", "softly", "."];
+  const DISTS = [
+    [["the", .58], ["a", .21], ["my", .09], ["top", .05], ["…", .07]],
+    [["mat", .64], ["floor", .14], ["sofa", .09], ["rug", .07], ["…", .06]],
+    [[",", .41], ["and", .29], [".", .18], ["while", .05], ["…", .07]],
+    [["purring", .37], ["happy", .20], ["and", .18], ["content", .12], ["…", .13]],
+    [["softly", .45], ["away", .22], ["loudly", .11], [".", .10], ["…", .12]],
+    [[".", .60], [",", .20], ["and", .10], ["as", .04], ["…", .06]],
+  ];
+  Atlas.scene("loop", (g, s) => {
+    const { W, H, narrow } = g;
+    const b = s.b;
+    const period = 1.6;
+    const genT = b >= 1.6 ? s.t : 0;
+    const cyc = (GEN.length + 2) * period;
+    const tl = b >= 1.6 ? (genT % cyc) : 0;
+    const ngen = b < 1.6 ? 0 : Math.min(GEN.length, Math.floor(tl / period));
+    const fly = b < 1.6 ? 0 : (tl % period) / period;
+    const kshow = Math.min(GEN.length - 1, ngen);
+    // layout
+    const fs = narrow ? 20 : 24;
+    const rowY = 92;
+    const toks = PROMPT.concat(GEN.slice(0, ngen));
+    let x = 40;
+    const lay = [];
+    toks.forEach((tk) => { const w = g.tw(tk, fs, "mono", 500) + 24; lay.push([x, w]); x += w + 10; });
+    const nextX = x;
+    const mx = narrow ? W * 0.5 : W * 0.3, my = narrow ? H * 0.33 : H * 0.42, mw = narrow ? W * 0.62 : W * 0.36, mh = 110;
+    const dx0 = narrow ? W * 0.2 : W * 0.6, dy0 = narrow ? my + mh / 2 + 70 : my - 105, bw = narrow ? W * 0.55 : W * 0.28;
+    // token row
+    toks.forEach((tk, i) => {
+      const [tx, w] = lay[i];
+      const isGen = i >= PROMPT.length;
+      const pre = s.at(3) * (i < PROMPT.length ? 1 : 0);
+      g.pill(tx, rowY, tk, { size: fs, color: isGen ? "ok" : "ink", stroke: isGen ? "ok" : pre ? "compute" : "hair", lw: pre ? 2.5 : 1.5 });
+    });
+    // arrows row -> model -> dist
+    g.arrow(mx, rowY + 26, mx, my - mh / 2 - 6, { color: "ink-3", lw: 2 });
+    g.box(mx - mw / 2, my - mh / 2, mw, mh, { color: "compute", title: "MODEL", sub: "f(tokens) → P(next token)", tsize: 34, ssize: 15 });
+    if (narrow) g.arrow(mx, my + mh / 2 + 4, mx, dy0 - 34, { color: "ink-3", lw: 2 });
+    else g.arrow(mx + mw / 2 + 6, my, dx0 - 70, my, { color: "ink-3", lw: 2 });
+    // distribution
+    const dist = DISTS[kshow];
+    g.text("P(next token)", dx0, dy0 - 18, { size: 15, color: "ink-3" });
+    dist.forEach(([w, p], i) => {
+      const y = dy0 + i * 40;
+      const chosen = i === 0 && (b >= 0.6);
+      const grow = ramp(s.t % 100, 0, 0.6);
+      g.text(w, dx0 - 12, y + 16, { size: 18, align: "right", color: chosen ? "ok" : "ink-2", weight: chosen ? 600 : 500 });
+      g.rect(dx0, y, bw, 22, { fill: "grid", r: 4 });
+      g.rect(dx0, y, bw * (p / 0.65) * grow, 22, { fill: chosen ? "ok" : "compute", r: 4, a: chosen ? 0.9 : 0.55 });
+      g.text(p.toFixed(2), dx0 + bw * (p / 0.65) + 8, y + 16, { size: 14, color: "ink-3" });
+    });
+    g.text("…and 129,275 more entries", dx0, dy0 + 5 * 40 + 14, { size: 14, color: "ink-3", a: ramp(b, 0, 0.5) });
+    // sampling callout
+    const sa = s.at(1) * (1 - s.at(2) * 0.6);
+    if (narrow) g.callout(dx0 + bw * (dist[0][1] / 0.65), dy0 + 11, dx0 + bw * 0.7, dy0 - 46, "sample → one token", { color: "ok", a: sa, left: true });
+    else g.callout(dx0 + bw * (dist[0][1] / 0.65), dy0 + 11, dx0 + bw * 0.95, dy0 - 50, "sample → one token", { color: "ok", a: sa });
+    // flying token back to the row (beats 2+)
+    if (b >= 1.6 && ngen < GEN.length) {
+      const u = ease(clamp(fly * 1.4));
+      const p0 = [dx0 - 30, dy0 + 11], p2 = [nextX + 20, rowY], p1 = narrow ? [W - 30, (dy0 + rowY) / 2] : [W - 40, rowY + 40];
+      const [px, py] = g.bez(p0, p1, p2, u);
+      g.curve(p0, p1, p2, { color: "ok", lw: 1.5, a: 0.35, arrow: true, dash: [5, 6] });
+      g.pill(px, py, GEN[ngen], { size: fs, color: "ok", stroke: "ok", align: "center", fill: "sheet" });
+      g.text("append, call again", p1[0] - 8, p1[1] - 12, { size: 14, color: "ok", align: "right", a: 0.8 });
+    }
+    // timeline (beat 3)
+    const ta = s.at(3);
+    if (ta > 0) {
+      const ty = H - 92, tx0 = 40, tx1 = W - 40;
+      g.text("forward passes over time", tx0, ty - 16, { size: 14, color: "ink-3", a: ta });
+      const preW = (tx1 - tx0) * 0.18;
+      g.rect(tx0, ty, preW * ta, 34, { fill: "compute", r: 4, a: 0.85 * ta });
+      g.text("PREFILL · whole prompt", tx0 + 8, ty + 23, { size: 14, color: "sheet", weight: 600, a: ta });
+      const nd = 22, dw = (tx1 - tx0 - preW - 10) / nd;
+      for (let k = 0; k < nd; k++) g.rect(tx0 + preW + 10 + k * dw, ty, dw * 0.7, 34, { fill: "memory", r: 3, a: ta * (k < ngen + 4 ? 0.85 : 0.25) });
+      g.dim(tx0 + preW + 10, tx1, ty + 56, "DECODE · one token per pass", { color: "memory", a: ta });
+    }
+  }, { anim: true, restT: 3.3 });
+
+  /* ---------------- KV cache ---------------- */
+  const KVT = ["The", "cat", "sat", "on", "the", "mat", ",", "it"];
+  Atlas.scene("kv", (g, s) => {
+    const { W, H, narrow } = g;
+    const n = KVT.length, x0 = narrow ? 70 : 110, x1 = W - 50;
+    const xs = KVT.map((_, i) => x0 + ((x1 - x0) * i) / (n - 1));
+    const rowY = narrow ? 150 : 170;
+    // arcs (beat 0)
+    for (let j = 0; j < n - 1; j++) {
+      const p0 = [xs[n - 1], rowY - 22], p2 = [xs[j], rowY - 22];
+      const mid = [(p0[0] + p2[0]) / 2, rowY - 40 - (xs[n - 1] - xs[j]) * 0.11];
+      g.curve(p0, mid, p2, { color: "compute", lw: 2, a: 0.7, prog: ease(clamp(ramp(s.t % 6, (n - 2 - j) * 0.12, 0.5))) });
+    }
+    g.text("query", xs[n - 1], rowY - 52, { size: 14, color: "compute", align: "center", weight: 600 });
+    KVT.forEach((tk, i) => g.pill(xs[i], rowY, tk, { size: narrow ? 16 : 19, align: "center", color: i === n - 1 ? "compute" : "ink", stroke: i === n - 1 ? "compute" : "hair", lw: 2 }));
+    // K/V stacks (beat 1+)
+    const L = 4, cell = narrow ? 17 : 22, gap = 8;
+    for (let i = 0; i < n; i++) for (let l = 0; l < L; l++) {
+      const a = ramp(s.b, 0.25 + (i * 0.06 + l * 0.04), 0.35);
+      const y = rowY + 44 + l * (cell + gap);
+      g.rect(xs[i] - cell - 2, y, cell, cell, { fill: "memory", r: 4, a });
+      g.rect(xs[i] + 2, y, cell, cell, { fill: "memory", r: 4, a: a * 0.55 });
+    }
+    const la = s.at(1);
+    g.text("K", xs[0] - cell / 2 - 2, rowY + 38, { size: 13, color: "memory", align: "center", weight: 600, a: la });
+    g.text("V", xs[0] + cell / 2 + 2, rowY + 38, { size: 13, color: "memory", align: "center", weight: 600, a: la });
+    g.dim(rowY + 44, rowY + 44 + L * (cell + gap) - gap, x0 - 36, "", { vertical: true, color: "ink-3", a: la });
+    g.text("layers", x0 - 50, rowY + 44 + L * (cell + gap) + 18, { size: 13, color: "ink-3", a: la });
+    // beat 2: work counter
+    const ca = s.solo(2);
+    const stackBottom = rowY + 44 + L * (cell + gap);
+    if (ca > 0.01) {
+      const y = stackBottom + 40, bw = (W - 100) / 2 - 10;
+      g.rect(40, y, bw, 150, { fill: "sheet", stroke: "bad", lw: 1.8, r: 10, a: ca });
+      g.text("WITHOUT A CACHE", 60, y + 34, { size: 20, font: "display", weight: 700, color: "bad", a: ca });
+      g.text("1,000 output tokens cost", 60, y + 66, { size: 15, color: "ink-2", a: ca });
+      g.text("500,500", 60, y + 118, { size: 46, font: "display", weight: 800, color: "bad", a: ca });
+      g.text("token passes", 60 + g.tw("500,500", 46, "display", 800) + 12, y + 116, { size: 15, color: "ink-2", a: ca });
+      const x2 = 40 + bw + 20;
+      g.rect(x2, y, bw, 150, { fill: "sheet", stroke: "ok", lw: 1.8, r: 10, a: ca });
+      g.text("WITH A KV CACHE", x2 + 20, y + 34, { size: 20, font: "display", weight: 700, color: "ok", a: ca });
+      g.text("1,000 output tokens cost", x2 + 20, y + 66, { size: 15, color: "ink-2", a: ca });
+      g.text("1,000", x2 + 20, y + 118, { size: 46, font: "display", weight: 800, color: "ok", a: ca });
+      g.text("token passes", x2 + 20 + g.tw("1,000", 46, "display", 800) + 12, y + 116, { size: 15, color: "ink-2", a: ca });
+      g.rect(xs[n - 1] - cell - 8, rowY + 38, cell * 2 + 16, L * (cell + gap) + 8, { stroke: "ok", lw: 2.5, r: 8, a: ca });
+    }
+    // beat 3: memory bar
+    const ma = s.at(3);
+    if (ma > 0.01) {
+      const y = stackBottom + 60, bx0 = 40, bx1 = W - 40, bh = 64;
+      g.text("GPU MEMORY (HBM)", bx0, y - 14, { size: 18, font: "display", weight: 700, color: "ink", a: ma });
+      g.rect(bx0, y, bx1 - bx0, bh, { fill: "grid", stroke: "hair", r: 8, a: ma });
+      const wf = 0.38;
+      g.rect(bx0, y, (bx1 - bx0) * wf, bh, { fill: "ink-3", r: 8, a: ma * 0.55 });
+      g.text("weights", bx0 + 14, y + 39, { size: 16, color: "sheet", weight: 600, a: ma });
+      const grow = (s.t % 9) / 9;
+      let x = bx0 + (bx1 - bx0) * wf + 4;
+      const reqs = [0.14, 0.09, 0.12, 0.07, 0.11, 0.08];
+      reqs.forEach((f, i) => {
+        const gg = clamp(grow * 1.8 - i * 0.18);
+        let w = (bx1 - bx0) * f * gg;
+        if (x + w > bx1 - 4) w = Math.max(0, bx1 - 4 - x);
+        g.rect(x, y + 6, w, bh - 12, { fill: "memory", r: 5, a: ma * (0.45 + 0.08 * i) });
+        if (w > 48) g.text("req " + String.fromCharCode(65 + i), x + w / 2, y + 38, { size: 14, color: "ink", align: "center", weight: 600, a: ma });
+        x += w + (w > 0 ? 4 : 0);
+      });
+      const full = x > bx1 - 30;
+      g.text(full ? "full: the next request has to wait" : "free", bx1 - 10, y + bh + 26, { size: 15, color: full ? "bad" : "ink-3", align: "right", a: ma });
+      g.text("each running request's KV grows by one token per step", bx0, y + bh + 26, { size: 15, color: "ink-2", a: ma });
+    }
+  }, { anim: true, restT: 4 });
+
+  /* ---------------- memory wall ---------------- */
+  const DEC = [[103, 26300, "256"], [179, 22800, "128"], [246, 15700, "64"], [297, 9500, "32"], [315, 5050, "16"], [325, 2600, "8"]];
+  Atlas.scene("wall", (g, s) => {
+    const { W, H, narrow } = g;
+    const chartA = s.swapIn(3);
+    const diag = s.swapOut(3);
+    if (diag > 0.01) {
+      const a = diag;
+      const top = narrow ? 70 : 90;
+      const bw = narrow ? W * 0.36 : W * 0.28, bh = narrow ? 200 : 230;
+      const hx = 40, cx = W - 40 - bw;
+      // HBM
+      g.box(hx, top, bw, bh, { color: "memory", wash: 0.08, a });
+      g.text("HBM", hx + bw / 2, top + 36, { size: 28, font: "display", weight: 800, color: "memory", align: "center", a });
+      g.text("weights + KV", hx + bw / 2, top + 58, { size: 13, color: "ink-2", align: "center", a });
+      const cols = 5, rows = 4, cw = (bw - 40) / cols;
+      for (let r = 0; r < rows; r++) for (let q = 0; q < cols; q++) g.rect(hx + 20 + q * cw, top + 76 + r * ((bh - 96) / rows), cw - 6, (bh - 96) / rows - 6, { fill: "memory", r: 3, a: a * 0.32 });
+      // compute
+      const batch64 = s.at(2);
+      const util = 0.04 + 0.86 * batch64;
+      g.box(cx, top, bw, bh, { color: "compute", wash: 0.08, a });
+      g.text("COMPUTE", cx + bw / 2, top + 36, { size: 28, font: "display", weight: 800, color: "compute", align: "center", a });
+      g.text("tensor cores", cx + bw / 2, top + 58, { size: 13, color: "ink-2", align: "center", a });
+      const R = rng(Math.floor(s.t * 5) + 1);
+      for (let r = 0; r < rows; r++) for (let q = 0; q < cols; q++) { const lit = R() < util; g.rect(cx + 20 + q * cw, top + 76 + r * ((bh - 96) / rows), cw - 6, (bh - 96) / rows - 6, { fill: lit ? "compute" : "grid", r: 3, a: a * (lit ? 0.85 : 1) }); }
+      // pipe
+      const py = top + bh / 2, px0 = hx + bw, px1 = cx;
+      g.rect(px0, py - 16, px1 - px0, 32, { fill: "grid", stroke: "hair", r: 16, a });
+      for (let k = 0; k < 6; k++) { const xx = px0 + 10 + (((s.t * 120) + k * ((px1 - px0) / 6)) % (px1 - px0 - 40)); g.rect(xx, py - 7, 22, 14, { fill: "memory", r: 3, a: a * 0.9 }); }
+      g.text("≈ 8 TB/s", (px0 + px1) / 2, py - 26, { size: 15, color: "memory", align: "center", weight: 600, a });
+      // utilization
+      const uy = top + bh + 34;
+      g.text("compute used", cx, uy, { size: 14, color: "ink-3", a });
+      g.rect(cx, uy + 10, bw, 14, { fill: "grid", r: 7, a });
+      g.rect(cx, uy + 10, bw * util, 14, { fill: "compute", r: 7, a });
+      g.text(Math.round(util * 100) + "%", cx + bw, uy, { size: 14, color: "ink", align: "right", weight: 600, a });
+      g.chip(cx + bw / 2, top - 26, batch64 > 0.5 ? "batch = 64" : "batch = 1", batch64 > 0.5 ? "ok" : "bad", { align: "center", a: a * ramp(s.b, 0.4, 0.5) });
+      // output tokens
+      const oy = top + bh + 90;
+      g.text("tokens produced by this step", 40, oy, { size: 14, color: "ink-3", a });
+      const nt = batch64 > 0.5 ? 64 : 1;
+      const per = narrow ? 16 : 32, sz = narrow ? 14 : 16;
+      for (let k = 0; k < nt; k++) { const r = Math.floor(k / per), q = k % per; g.rect(40 + q * (sz + 5), oy + 14 + r * (sz + 5), sz, sz, { fill: "ok", r: 3, a: a * ramp(s.b, 1.6 + k * 0.004, 0.3) * (nt === 1 ? 1 : 1) }); }
+      if (nt === 1) g.rect(40, oy + 14, sz, sz, { fill: "ok", r: 3, a });
+      // intensity note
+      g.text(batch64 > 0.5 ? "≈ 128 FLOPs per weight byte" : "≈ 2 FLOPs per weight byte", W - 40, oy, { size: 14, color: batch64 > 0.5 ? "ok" : "bad", align: "right", weight: 600, a: a * ramp(s.b, 0.4, 0.5) });
+    }
+    if (chartA > 0.01) {
+      const x0 = narrow ? 110 : 130, x1 = W - 50, y0 = 80, y1 = H - 120;
+      g.chart({ x0, y0, x1, y1, xmax: 350, ymax: 30000, xticks: [0, 100, 200, 300], yticks: [0, 10000, 20000, 30000], fy: (v) => (v ? v / 1000 + "k" : "0"),
+        xlabel: "per-user speed (tokens / s / user)", ylabel: "throughput (tokens / s / GPU)", series: [{ pts: DEC, color: "compute", area: true }], prog: ramp(s.b, 2.4, 0.6), a: chartA, tsize: 14, ylabelOff: 70 });
+      g.text("DeepSeek V4.1 Flash decode · EP64 · 128K context · labels = requests per GPU", x1, y0 - 28, { size: 13, color: "ink-3", align: "right", a: chartA });
+      g.text("values read from the repo's benchmark chart", x1, H - 34, { size: 12, color: "ink-3", align: "right", a: chartA });
+    }
+  }, { anim: true, restT: 1 });
+
+  /* ---------------- roofline lab ---------------- */
+  const BW = 8e12, PEAK = 4.5e15;
+  const fmtCtx = (v) => { const n = Math.round(Math.pow(2, v)); return n >= 1024 ? Math.round(n / 1024) + "K" : String(n); };
+  function roofModel(st) {
+    const batch = Math.max(1, Math.round(Math.pow(2, st.batch)));
+    const ctx = Math.pow(2, st.ctx);
+    const wB = st.wgb * 1e9, kvB = st.kvb * 1024 * ctx * batch;
+    const flops = 2 * st.wgb * 1e9 * batch + 4 * ctx * batch * 1024; // weights at 1 byte/param + attention
+    const tMem = (wB + kvB) / BW, tCmp = flops / PEAK;
+    const t = Math.max(tMem, tCmp) + 0.0012; // + fixed launch/sampling overhead
+    return { batch, ctx, wB, kvB, flops, tMem, tCmp, t, ai: flops / (wB + kvB), perUser: 1 / t, perGpu: batch / t, util: (flops / t) / PEAK };
+  }
+  Atlas.scene("roof", (g, s) => {
+    const st = s.state; if (st.batch === undefined) return;
+    const m = roofModel(st);
+    document.getElementById("o-step").textContent = (m.t * 1000).toFixed(1);
+    document.getElementById("o-user").textContent = Math.round(m.perUser).toLocaleString();
+    document.getElementById("o-gpu").textContent = Math.round(m.perGpu).toLocaleString();
+    document.getElementById("o-util").textContent = (m.util * 100).toFixed(1) + "%";
+    const { W, H } = g;
+    const x0 = 110, x1 = W - 40, y0 = 70, y1 = H - 210;
+    // log-log roofline: x = AI 0.5..4096, y = FLOP/s 1e12..1e16
+    const lx = (v) => x0 + (x1 - x0) * (Math.log2(v) - Math.log2(0.5)) / (Math.log2(4096) - Math.log2(0.5));
+    const ly = (v) => y1 - (y1 - y0) * (Math.log10(v) - 12) / (16 - 12);
+    [1e12, 1e13, 1e14, 1e15, 1e16].forEach((v) => { g.line(x0, ly(v), x1, ly(v), { color: "grid", lw: 1 }); g.text(["1T", "10T", "100T", "1P", "10P"][Math.log10(v) - 12], x0 - 10, ly(v) + 5, { size: 13, color: "ink-3", align: "right" }); });
+    [1, 4, 16, 64, 256, 1024, 4096].forEach((v) => { g.text(String(v), lx(v), y1 + 20, { size: 13, color: "ink-3", align: "center" }); });
+    g.text("FLOPs per byte read (arithmetic intensity)", (x0 + x1) / 2, y1 + 44, { size: 14, color: "ink-2", align: "center" });
+    g.ctx.save(); g.ctx.translate(x0 - 62, (y0 + y1) / 2); g.ctx.rotate(-Math.PI / 2); g.text("achieved FLOP/s", 0, 0, { size: 14, color: "ink-2", align: "center" }); g.ctx.restore();
+    // roof
+    const ridge = PEAK / BW;
+    const pts = [];
+    for (let v = 0.5; v <= 4096; v *= 1.15) pts.push([lx(v), ly(Math.min(PEAK, v * BW))]);
+    g.poly(pts, { color: "ink-2", lw: 2.5 });
+    g.text("bandwidth wall", lx(2), ly(2 * BW) - 14, { size: 13, color: "memory", weight: 600 });
+    g.text("compute wall", lx(1500), ly(PEAK) - 12, { size: 13, color: "compute", weight: 600, align: "center" });
+    g.line(lx(ridge), y0, lx(ridge), y1, { color: "hair", dash: [4, 6] });
+    g.text("ridge ≈ " + Math.round(ridge), lx(ridge) + 6, y1 - 8, { size: 12, color: "ink-3" });
+    // point
+    const ach = m.flops / m.t;
+    const px = lx(clamp(m.ai, 0.5, 4096)), py = ly(clamp(ach, 1e12, 1e16));
+    g.circle(px, py, 10, { fill: m.tCmp > m.tMem ? "compute" : "memory", stroke: "sheet", lw: 3 });
+    g.callout(px, py, Math.min(px + 40, x1 - 220), py - 40, `batch ${m.batch} · ${m.tCmp > m.tMem ? "compute-bound" : "memory-bound"}`, { color: "ink" });
+    // time bar
+    const by = H - 140, bx0 = 40, bx1 = W - 40, tmax = Math.max(m.t, 0.002);
+    g.text("where the step's time goes", bx0, by - 12, { size: 14, color: "ink-3" });
+    const wT = m.wB / BW, kT = m.kvB / BW;
+    const sc = (bx1 - bx0) / (Math.max(wT + kT, m.tCmp) + 0.0012);
+    g.rect(bx0, by, wT * sc, 26, { fill: "memory", r: 4, a: 0.9 });
+    g.rect(bx0 + wT * sc, by, kT * sc, 26, { fill: "memory", r: 4, a: 0.45 });
+    g.rect(bx0, by + 34, m.tCmp * sc, 26, { fill: "compute", r: 4, a: 0.85 });
+    g.hatch(bx0 + Math.max(wT + kT, m.tCmp) * sc, by, 0.0012 * sc, 60, { color: "cpu" });
+    g.text(`read weights ${(wT * 1000).toFixed(2)} ms`, bx0, by + 88, { size: 13, color: "memory" });
+    g.text(`read KV ${(kT * 1000).toFixed(2)} ms`, bx0 + 230, by + 88, { size: 13, color: "memory" });
+    g.text(`math ${(m.tCmp * 1000).toFixed(2)} ms (overlaps)`, bx0, by + 110, { size: 13, color: "compute" });
+    g.text("fixed overhead 1.2 ms", bx1, by + 110, { size: 13, color: "cpu", align: "right" });
+  }, { controls: "roof-ctl", format: (id, v) => id === "batch" ? String(Math.max(1, Math.round(Math.pow(2, v)))) : id === "ctx" ? fmtCtx(v) : id === "wgb" ? String(v) : v.toFixed(1) + " KB" });
+
+  /* ---------------- continuous batching ---------------- */
+  // fixed request lengths for both lanes
+  const REQ = [5, 9, 3, 12, 6, 4, 8, 7, 3, 10, 5, 6, 9, 4, 7, 3, 11, 5, 8, 6, 4, 9, 5, 7];
+  function simStatic(slots, T) {
+    const lanes = Array.from({ length: slots }, () => []);
+    let t = 0, q = 0;
+    while (t < T && q < REQ.length) {
+      let mx = 0;
+      for (let s = 0; s < slots && q < REQ.length; s++, q++) { lanes[s].push([t, REQ[q], q]); mx = Math.max(mx, REQ[q]); }
+      for (let s = 0; s < slots; s++) { const last = lanes[s][lanes[s].length - 1]; if (last && last[0] === t && last[1] < mx) lanes[s].push([t + last[1], mx - last[1], -1]); }
+      t += mx;
+    }
+    return lanes;
+  }
+  function simCont(slots, T) {
+    const lanes = Array.from({ length: slots }, () => []); const free = Array(slots).fill(0); let q = 0;
+    while (q < REQ.length) { let s = free.indexOf(Math.min(...free)); if (free[s] >= T) break; lanes[s].push([free[s], REQ[q], q]); free[s] += REQ[q]; q++; }
+    return lanes;
+  }
+  Atlas.scene("cb", (g, s) => {
+    const { W, H, narrow } = g;
+    const slots = 8, T = 30;
+    const lx0 = narrow ? 70 : 150, lx1 = W - 30;
+    const sc = (lx1 - lx0) / T;
+    const cyc = 12, tt = (s.t % cyc) / (cyc - 2);
+    const cursor = clamp(tt) * T;
+    const blocks = [["STATIC BATCHING", simStatic(slots, T), "bad"], ["CONTINUOUS BATCHING", simCont(slots, T), "ok"]];
+    const laneH = Math.min(26, (H - 160) / (2 * slots + 4)), gap = 4;
+    blocks.forEach(([name, lanes, c], bi) => {
+      const top = 54 + bi * (slots * (laneH + gap) + 70);
+      g.text(name, 30, top - 12, { size: 20, font: "display", weight: 800, color: c });
+      let done = 0;
+      lanes.forEach((lane, si) => {
+        const y = top + si * (laneH + gap);
+        if (!narrow) g.text("slot " + si, lx0 - 12, y + laneH * 0.7, { size: 12, color: "ink-3", align: "right" });
+        g.rect(lx0, y, lx1 - lx0, laneH, { fill: "grid", r: 3 });
+        lane.forEach(([st, ln, id]) => {
+          if (st >= cursor) return;
+          const vis = Math.min(ln, cursor - st);
+          if (id < 0) { g.hatch(lx0 + st * sc, y, vis * sc, laneH, { color: "bad" }); return; }
+          g.rect(lx0 + st * sc + 1, y + 1, vis * sc - 2, laneH - 2, { fill: "compute", r: 3, a: 0.25 + 0.6 * ((id * 37) % 10) / 10 });
+          if (st + ln <= cursor) done++;
+        });
+      });
+      g.text(`${done} requests finished`, lx1, top - 12, { size: 14, color: "ink-2", align: "right", weight: 600 });
+    });
+    g.line(lx0 + cursor * sc, 40, lx0 + cursor * sc, H - 30, { color: "ink", lw: 1.5, a: 0.5 });
+  }, { anim: true, restT: 9 });
+})();
+
+</script>
+<script>AtlasAlts.render("alts-loop", "sources-loop", "loop");</script>
+</body>
+</html>
